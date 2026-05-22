@@ -1,0 +1,15 @@
+# latex-utils — a Gas City pack of LaTeX helper utilities.
+#
+# A utility/asset pack: it ships reusable LaTeX scripts and assets that rigs
+# can import (e.g. the phd-thesis rig). It defines no agents or named sessions
+# of its own — import it alongside a role-providing pack.
+#
+# Import into a rig via city.toml:
+#   [[rigs]]
+#   name = "phd-thesis"
+#   [rigs.imports.latex-utils]
+#   source = "packs/latex-utils"
+
+[pack]
+name = "latex-utils"
+schema = 2
