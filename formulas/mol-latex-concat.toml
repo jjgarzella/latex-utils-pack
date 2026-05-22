@@ -1,0 +1,320 @@
+description = """
+Concatenate multiple standalone LaTeX documents into a single destination
+project — moving sources together, hoisting their preambles into one global
+preamble, mirroring each source's directory tree, wiring everything via
+`\\input`, and HARD-GATING on a clean local compile.
+
+Each source paper becomes one chapter, in the order given by `sources`. The
+result is left on disk and committed in the destination (no push), with a
+`REPORT.md` recording every rename, prefix, merge, and flagged conflict for
+human review.
+
+This formula assumes a complete local LaTeX toolchain (pdflatex + bibtex). It
+installs nothing. The compile gate is a plain local hard-fail, not a CI/gate
+bead.
+
+## Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| sources  | yes | Comma-separated, ordered list of source document directories. Order = chapter order. |
+| dest     | no  | Destination project directory. Empty → a fresh blank `merged-latex/` is created and `git init`ed. |
+
+## What the agent infers per source
+
+- **entry file** — the `.tex` containing `\\begin{document}`
+- **slug** — a short abbreviation (e.g. `ahks`, `ptw`, `pid`) used to namespace
+  renamed macros, prefixed labels, and the chapter directory
+- **title** — from the source's `\\title{}`, used as the `\\chapter{}` title
+
+Anything ambiguous is FLAGGED in `REPORT.md` rather than guessed silently.
+
+## Design decisions (locked)
+
+- **Destination-agnostic.** Empty `dest` → blank self-contained `merged-latex/`
+  with `\\documentclass{report}`, `git init`ed, committed (not pushed). An
+  existing `dest` (e.g. a UCSD `thesis-template`) → merge in and RESPECT its
+  document class and master preamble; commit in place (not pushed).
+- **Compile = hard gate.** `assets/scripts/build-verify.sh` must pass: pdflatex
+  (nonstopmode/halt-on-error) → bibtex over every citing aux → pdflatex ×2, and
+  the log must be free of errors, undefined refs/citations, and multiply-defined
+  labels. No CI, no gate bead.
+- **Header resolution = hoist into one global preamble.** Union `\\usepackage`
+  deduped by name, dropping class-owned/conflicting packages (geometry, fonts,
+  margins); conflicting package OPTIONS are flagged for the human. Macros are
+  hoisted; identical bodies collapse to one; DIVERGENT collisions get the later
+  chapter's macro renamed with a per-paper slug suffix (earlier chapter keeps
+  the bare name) and uses find-replaced within that chapter. Labels are
+  PROACTIVELY slug-prefixed per chapter with refs find-replaced. Citations are
+  merged + deduped into one bib (keys NOT prefixed); exact-duplicate entries
+  collapse; same-key-different-work gets a slug-rename with `\\cite` uses
+  find-replaced.
+- **Directory mirroring.** Each source → `contents/<slug>/`, mirroring the
+  source tree verbatim (sub-tex, figures, local `.sty` like `quiver.sty`). Entry
+  file → `contents/<slug>/main.tex` with the preamble and document-wrapper
+  stripped. Relative paths are rewritten (`\\input{intro}` →
+  `\\input{contents/<slug>/intro}`, `\\includegraphics{foo.jpg}` →
+  `contents/<slug>/foo.jpg`). No sectioning demotion (papers top out at
+  `\\section`).
+- **Per-paper frontmatter → chapter.** `\\maketitle`/`\\title`/`\\date`/inner
+  `\\tableofcontents` removed; `\\begin{abstract}` kept as `\\section*{Abstract}`
+  at chapter top; `\\author` dropped as a macro BUT coauthorship preserved as a
+  FLAGGED chapter footnote; trailing `\\bibliography` removed (keys flow to the
+  merged bib).
+"""
+formula = "mol-latex-concat"
+version = 1
+
+[vars]
+[vars.sources]
+description = "Comma-separated ordered list of source LaTeX document directories. Order is chapter order."
+required = true
+
+[vars.dest]
+description = "Destination project directory. Empty creates a fresh blank merged-latex/ and git inits it."
+required = false
+default = ""
+
+[[steps]]
+id = "inspect"
+title = "Inspect sources and infer entry/slug/title per paper"
+description = """
+Understand every source document before touching anything.
+
+For each directory in `{{sources}}` (split on commas, preserve order — this is
+chapter order):
+
+1. **Find the entry file** — the `.tex` containing `\\begin{document}`.
+   ```bash
+   grep -rl '\\\\begin{document}' <source-dir> --include='*.tex'
+   ```
+   If more than one matches (or none), FLAG it and pick the most plausible
+   master, noting the choice.
+
+2. **Derive a slug** — a short lowercase abbreviation of the paper, unique
+   across sources (e.g. `ahks`, `ptw`, `pid`). This namespaces renamed macros,
+   prefixed labels, and the chapter directory.
+
+3. **Read the title** — from `\\title{...}` in the entry file (may span lines).
+   This becomes the `\\chapter{}` title.
+
+4. **Catalog the preamble** — list every `\\usepackage` (with options), every
+   `\\newcommand`/`\\renewcommand`/`\\DeclareMathOperator`/`\\newtheorem`, every
+   `\\label`, every local `.sty`, and every included file / figure path.
+   Note `\\author`s (for the coauthorship footnote) and the bib backend
+   (`\\bibliography{...}` files vs `biblatex`).
+
+Write your findings to a working notes file (e.g. `/tmp/latex-concat-plan.md`)
+so later steps and `REPORT.md` can build on them. FLAG anything ambiguous;
+never guess silently.
+"""
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "scaffold-dest"
+title = "Open or scaffold the destination project"
+needs = ["inspect"]
+description = """
+Prepare the destination named by `{{dest}}`.
+
+**If `{{dest}}` is empty:** create a fresh blank project directory
+`merged-latex/` and initialize git in it.
+```bash
+mkdir -p merged-latex/contents
+cd merged-latex
+git init
+```
+Create a minimal `main.tex` with `\\documentclass{report}`, a placeholder
+preamble block (to be filled by the hoist step), `\\begin{document}`,
+`\\tableofcontents`, and `\\end{document}`.
+
+**If `{{dest}}` exists:** it is an established project (e.g. a UCSD
+`thesis-template` using `ucsddissertation.cls`). Do NOT overwrite its document
+class or master preamble — read and RESPECT them. Identify where chapters get
+`\\input` and where the master `\\bibliography` lives. The hoist/wire steps will
+merge into this existing preamble, not replace it.
+
+Record in your notes which mode you are in (blank vs existing) and the
+destination's document class.
+"""
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "transform-sources"
+title = "Mirror each source into contents/<slug>/ and rewrite paths"
+needs = ["scaffold-dest"]
+description = """
+For each source (in chapter order), copy its tree verbatim into
+`contents/<slug>/` of the destination, then transform the entry file.
+
+1. **Mirror the tree.** Copy all sub-`.tex`, figures (jpg/jpeg/png/pdf), and
+   local style files (e.g. `quiver.sty`) into `contents/<slug>/`, preserving
+   the source's internal layout.
+
+2. **Strip the entry file → `contents/<slug>/main.tex`.** Remove `\\documentclass`,
+   the entire preamble, `\\begin{document}`/`\\end{document}`, `\\maketitle`,
+   `\\title`/`\\date`, inner `\\tableofcontents`, and the trailing
+   `\\bibliography{...}`. KEEP the body. Convert `\\begin{abstract}...\\end{abstract}`
+   into `\\section*{Abstract}` at the top of the chapter body.
+
+3. **Rewrite relative paths** so they resolve from the destination root:
+   - `\\input{intro}` → `\\input{contents/<slug>/intro}`
+   - `\\includegraphics{...}{foo.jpg}` → `contents/<slug>/foo.jpg`
+   - any `\\usepackage{quiver}` style local-`.sty` references stay resolvable
+     (note these for the hoist step).
+
+4. **Coauthorship footnote.** If the source had multiple `\\author`s, add a
+   FLAGGED `\\footnote` at the chapter start crediting the coauthors, and record
+   it in your notes for `REPORT.md`. Do not carry `\\author` as a macro.
+
+No sectioning demotion — papers top out at `\\section`, which sits correctly
+under a `\\chapter`.
+"""
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "hoist-preamble"
+title = "Hoist preambles into one global preamble; resolve macro/label collisions"
+needs = ["transform-sources"]
+description = """
+Build the single global preamble (blank dest) or merge into the existing master
+preamble (existing dest).
+
+1. **Packages.** Union all `\\usepackage` lines, dedup by package name. DROP
+   class-owned or conflicting packages: `geometry`, font/margin packages, and
+   anything the destination's document class already provides. Where the same
+   package is requested with CONFLICTING options, keep one and FLAG the
+   conflict in `REPORT.md`. Local `.sty` files (e.g. `quiver`) keep working from
+   their `contents/<slug>/` location.
+
+2. **Macros** (`\\newcommand` / `\\DeclareMathOperator` / `\\newtheorem` / …).
+   Hoist all. If two papers define the same name with an IDENTICAL body, keep
+   one. If they define it with DIFFERENT bodies, the EARLIER chapter keeps the
+   bare name; rename the LATER chapter's macro with a per-paper slug suffix
+   (e.g. `\\foo` → `\\foopid`) and find-replace its uses within that chapter's
+   files only. Never just comment out a colliding macro.
+
+3. **Labels.** PROACTIVELY prefix every `\\label` in each chapter with the
+   chapter slug (e.g. `\\label{thm:main}` → `\\label{ahks:thm:main}`) and
+   find-replace every `\\ref`/`\\eqref`/`\\cref`/`\\autoref` to that label within
+   the chapter. This prevents cross-paper label clashes up front.
+
+Record every rename and dropped/flagged package in your notes.
+"""
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "merge-bib"
+title = "Merge and dedup all bibliographies into one thesis bib"
+needs = ["hoist-preamble"]
+description = """
+Collect every source's `.bib` into a single merged bibliography (e.g.
+`references.bib` in the blank dest, or the destination's existing master bib).
+
+- Bib keys are NOT slug-prefixed.
+- Collapse EXACT-duplicate entries (same key, same work) to one.
+- Where the SAME key refers to DIFFERENT works across papers, slug-rename the
+  colliding key in the later paper and find-replace its `\\cite{...}` uses within
+  that chapter.
+- Ensure the destination's `\\bibliography{...}` (or biblatex resource) points at
+  the merged bib. Per-paper trailing `\\bibliography` lines were already removed
+  in the transform step.
+
+Record every collapsed/renamed key in your notes.
+"""
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "wire-main"
+title = "Wire chapters into the master document"
+needs = ["merge-bib"]
+description = """
+Edit the destination's `main.tex` so each source appears as a chapter, in the
+order given by `{{sources}}`:
+
+```latex
+\\chapter{<inferred or overridden title>}
+\\input{contents/<slug>/main}
+```
+
+For an existing template, follow its established chapter-input idiom rather than
+inventing a new one. Ensure the master `\\bibliography{...}` (pointing at the
+merged bib) sits after the last chapter, and a single `\\tableofcontents` is
+present near the top. Allow a per-source title override if the inferred
+`\\title{}` is unsuitable (note any override).
+"""
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "compile-verify"
+title = "Compile gate — HARD FAIL unless the build is clean"
+needs = ["wire-main"]
+description = """
+Run the shipped compile gate against the destination. This is a HARD GATE: do
+not proceed to reporting until it passes.
+
+```bash
+# build-verify.sh ships in the latex-utils pack assets.
+bash <path-to>/latex-utils/assets/scripts/build-verify.sh <dest-dir> main.tex
+```
+
+The script runs pdflatex (nonstopmode/halt-on-error) → bibtex over every citing
+aux → pdflatex ×2, then scans the log. It exits non-zero on any pdflatex error,
+undefined reference, undefined citation, or multiply-defined label.
+
+If it FAILS: read the printed log lines (and the `.log` directly if needed),
+fix the offending source — usually a missed path rewrite, an unhoisted macro, a
+label/citation collision, or a dropped-but-needed package — and re-run. Repeat
+until the gate passes cleanly. Do NOT silence warnings to pass the gate; fix the
+underlying cause.
+
+This formula assumes a complete toolchain; if `build-verify.sh` reports a
+missing tool/package, that is an environment prerequisite to resolve, not a
+source defect.
+"""
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[steps.retry]
+max_attempts = 3
+on_exhausted = "hard_fail"
+
+[[steps]]
+id = "report-commit"
+title = "Write REPORT.md and commit the destination"
+needs = ["compile-verify"]
+description = """
+The tree compiles clean. Finalize.
+
+1. **Write `REPORT.md`** at the destination root documenting, per chapter:
+   - source → `contents/<slug>/` mapping and inferred slug/title
+   - every renamed macro (with old/new name and reason)
+   - every slug-prefixed label namespace
+   - every dropped or option-conflicting package (FLAGGED)
+   - every collapsed/renamed bib key
+   - coauthorship footnotes added
+   - any ambiguity flagged during inspection
+   This is the human's review surface — be specific.
+
+2. **Commit in the destination** (no push):
+   ```bash
+   cd <dest-dir>
+   git add -A
+   git commit -m "latex-concat: merge <N> papers into thesis"
+   ```
+   For a blank dest this is the first commit on the freshly `git init`ed repo;
+   for an existing repo it is a normal commit on its current branch. Do NOT
+   `git push`.
+
+3. **Close the formula step.** If `GC_BEAD_ID` is set, close it with a summary:
+   ```bash
+   if [ -n "${GC_BEAD_ID:-}" ]; then
+     bd update "$GC_BEAD_ID" --set-metadata gc.outcome=pass --status=closed \\
+       --notes "Concatenated <N> papers into <dest>; clean compile; committed (no push). See REPORT.md."
+   fi
+   ```
+
+**Exit criteria:** destination compiles clean via `build-verify.sh`, `REPORT.md`
+documents all transformations, the result is committed (not pushed), and the
+formula step is closed.
+"""
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
