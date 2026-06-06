@@ -1,69 +1,124 @@
-description = """
-Concatenate multiple standalone LaTeX documents into a single destination
-project — moving sources together, hoisting their preambles into one global
-preamble, mirroring each source's directory tree, wiring everything via
-`\\input`, and HARD-GATING on a clean local compile.
+description = '''
+Concatenate multiple standalone LaTeX documents into ONE destination project —
+each source paper becomes a `\chapter`, in the order given by `sources` — and
+HARD-GATE on a clean compile. General-purpose: the source papers, the destination
+document class, the TeX engine, and the bib backend are all parameters. The PhD
+dissertation is just test case #1, NOT the target — no UCSD/OGS specifics live here.
 
-Each source paper becomes one chapter, in the order given by `sources`. The
-result is left on disk and committed in the destination (no push), with a
-`REPORT.md` recording every rename, prefix, merge, and flagged conflict for
-human review.
+The result is left on disk and committed in the destination (no push), with a
+`REPORT.md` recording every rename, prefix, merge, and flagged conflict for human
+review. This formula installs nothing; it assumes a complete local LaTeX toolchain.
 
-This formula assumes a complete local LaTeX toolchain (pdflatex + bibtex). It
-installs nothing. The compile gate is a plain local hard-fail, not a CI/gate
-bead.
+## How it works — helpers decide, the agent handles exceptions
+
+The formula is HELPER-DRIVEN. Every mechanically-decidable transform is a small,
+individually-runnable Python helper under
+`{{.CityRoot}}/packs/latex-utils/assets/scripts/`. The formula ORCHESTRATES those
+helpers; it does NOT ask the agent to hand-edit `.tex`. The agent's job is judgment
+(slugs, title overrides, dest shape) and DEBUGGING (resolving flags, fixing compile
+failures) — not mechanical editing.
+
+All steps share ONE session (`gc.session_affinity = require`) and communicate
+through a single `plan.json` on disk — the agent<->script CONTRACT. The inspect step
+seeds it (the agent's slug/order/dest decisions + a parsed per-source inventory);
+every later helper READS plan.json and EXTENDS it; the compile gate enforces it;
+`write_report.py` renders `REPORT.md` from it.
+
+  schema  : {{.CityRoot}}/packs/latex-utils/assets/plan.schema.json
+  shared  : {{.CityRoot}}/packs/latex-utils/assets/scripts/planlib.py  (load/save/add_flag/add_log)
+  on disk : ${LATEX_CONCAT_PLAN:-${TMPDIR:-/tmp}/latex-concat/${GC_BEAD_ID}/plan.json}
+            (bead-keyed so a restart re-finds it; copied into the dest for the audit trail)
+
+## Three-tier flag protocol (LaTeX is not statically parseable — TeX is Turing-complete)
+
+- Tier 1 — GENUINELY MECHANICAL (sound in general): bib parse/dedup/merge, literal
+  path rewriting, body/wrapper stripping, package dedup-by-name, compile
+  orchestration, report rendering. Helpers just do these.
+- Tier 2 — mechanical over the well-behaved subset; FLAG-AND-DEFER, NEVER GUESS on
+  hard constructs: exotic classes, "class-owned" package detection, option
+  conflicts, custom/package-defined ref-like macros, same-key-different-work bib
+  collisions, catcode/\def trickery. A helper that meets one appends a record to
+  `plan.json.flags[]` and moves on — it does not guess.
+- Tier 3 — IRREDUCIBLY AGENTIC: the agent resolves every Tier-2 flag and fixes real
+  compile failures. The agent is an EXCEPTION-HANDLER + DEBUGGER, not a doer.
+- The COMPILE GATE is the safety net: anything a Tier-2 helper missed surfaces as
+  `undefined reference` / `undefined control sequence` / multiply-defined label, and
+  the agent fixes it before the gate can pass.
+
+## Scope envelope
+
+IN (robust): pdflatex / xelatex / lualatex via `tex_engine`; bibtex AND
+biblatex/biber (auto-detect); article / amsart / report-like sources with standard
+`\section…`; multi-file sources (`\input`/`\include`/`\subfiles`), local `.sty`,
+figures; each source must compile STANDALONE first; any existing dest class (blank
+=> `report`); arbitrarily many sources (>= 1).
+OUT => detect & flag/refuse: beamer / standalone / poster / letter classes; exotic
+`.bst` weirdness.
+Breadth caveat: biblatex/biber, xelatex/lualatex and exotic-class flagging are
+implemented best-effort but VALIDATED only on the pdflatex+bibtex path (the two
+acceptance runs use three `\bibliography{}` + pdflatex papers).
 
 ## Variables
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| sources  | yes | Comma-separated, ordered list of source document directories. Order = chapter order. |
-| dest     | no  | Destination project directory. Empty → a fresh blank `merged-latex/` is created and `git init`ed. |
+| Variable   | Required | Default     | Description |
+|------------|----------|-------------|-------------|
+| sources    | yes      | —           | Comma-separated, ORDERED list of source document dirs. Order = chapter order. |
+| dest       | no       | "" (blank)  | Destination project dir. Empty => a fresh blank `merged-latex/` (`\documentclass{report}`, `git init`ed). |
+| tex_engine | no       | pdflatex    | Compile engine: `pdflatex` \| `xelatex` \| `lualatex`. |
 
-## What the agent infers per source
+## What the agent infers per source (in the inspect step)
 
-- **entry file** — the `.tex` containing `\\begin{document}`
-- **slug** — a short abbreviation (e.g. `ahks`, `ptw`, `pid`) used to namespace
-  renamed macros, prefixed labels, and the chapter directory
-- **title** — from the source's `\\title{}`, used as the `\\chapter{}` title
-
-Anything ambiguous is FLAGGED in `REPORT.md` rather than guessed silently.
+- entry file — the `.tex` containing `\begin{document}`
+- slug — a short unique lowercase abbreviation (e.g. `ahks`, `ptw`, `pid`) that
+  namespaces renamed macros, prefixed labels, and the chapter directory
+- title — from the source `\title{}`, used as the `\chapter{}` title
+Anything ambiguous is FLAGGED in `plan.json`, never guessed silently.
 
 ## Design decisions (locked)
 
-- **Destination-agnostic.** Empty `dest` → blank self-contained `merged-latex/`
-  with `\\documentclass{report}`, `git init`ed, committed (not pushed). An
-  existing `dest` (e.g. a UCSD `thesis-template`) → merge in and RESPECT its
-  document class and master preamble; commit in place (not pushed).
-- **Compile = hard gate.** `assets/scripts/build-verify.sh` must pass: pdflatex
-  (nonstopmode/halt-on-error) → bibtex over every citing aux → pdflatex ×2, and
-  the log must be free of errors, undefined refs/citations, and multiply-defined
-  labels. No CI, no gate bead.
-- **Header resolution = hoist into one global preamble.** Union `\\usepackage`
-  deduped by name, dropping class-owned/conflicting packages (geometry, fonts,
-  margins); conflicting package OPTIONS are flagged for the human. Macros are
-  hoisted; identical bodies collapse to one; DIVERGENT collisions get the later
-  chapter's macro renamed with a per-paper slug suffix (earlier chapter keeps
-  the bare name) and uses find-replaced within that chapter. Labels are
-  PROACTIVELY slug-prefixed per chapter with refs find-replaced. Citations are
-  merged + deduped into one bib (keys NOT prefixed); exact-duplicate entries
-  collapse; same-key-different-work gets a slug-rename with `\\cite` uses
-  find-replaced.
-- **Directory mirroring.** Each source → `contents/<slug>/`, mirroring the
-  source tree verbatim (sub-tex, figures, local `.sty` like `quiver.sty`). Entry
-  file → `contents/<slug>/main.tex` with the preamble and document-wrapper
-  stripped. Relative paths are rewritten (`\\input{intro}` →
-  `\\input{contents/<slug>/intro}`, `\\includegraphics{foo.jpg}` →
-  `contents/<slug>/foo.jpg`). No sectioning demotion (papers top out at
-  `\\section`).
-- **Per-paper frontmatter → chapter.** `\\maketitle`/`\\title`/`\\date`/inner
-  `\\tableofcontents` removed; `\\begin{abstract}` kept as `\\section*{Abstract}`
-  at chapter top; `\\author` dropped as a macro BUT coauthorship preserved as a
-  FLAGGED chapter footnote; trailing `\\bibliography` removed (keys flow to the
-  merged bib).
-"""
+- Helpers, not prose. Mechanically-decidable transforms are small Python helpers in
+  `assets/scripts/`, each individually runnable and testable (feed a `plan.json` +
+  sources, assert the extended `plan.json`). The formula orchestrates; it never tells
+  the agent to hand-edit `.tex`.
+- plan.json is the contract. The inspect step's agent decisions and per-source
+  inventory are written to `plan.json`; every later helper reads and extends it; the
+  report is rendered from it. Validated against `assets/plan.schema.json`.
+- Per-source baseline. Each source MUST compile standalone before it is touched; a
+  won't-compile source fails the run early with its own log (it is the source's
+  defect, not something to "fix into" the merge).
+- Compile = hard gate. `verify.py --final` must pass: the chosen `tex_engine`
+  (nonstopmode/halt-on-error) -> bibtex OR biblatex/biber over every citing aux ->
+  re-runs to settle, and the log must be free of errors, undefined refs/citations,
+  and multiply-defined labels. No CI, no gate bead.
+- Destination-agnostic. Empty `dest` => a blank self-contained `merged-latex/` with
+  `\documentclass{report}`, `git init`ed, committed (not pushed). An existing `dest`
+  (e.g. a UCSD `thesis-template` on `ucsddissertation.cls`) => merge in and RESPECT
+  its document class and master preamble; commit in place (not pushed).
+- Header resolution = hoist into one global preamble. Union `\usepackage` deduped by
+  name, dropping class-owned/conflicting packages (geometry, fonts, margins);
+  conflicting OPTIONS are FLAGGED. Macros are hoisted; identical bodies collapse to
+  one; DIVERGENT collisions get the LATER chapter's macro renamed with a per-slug
+  suffix (earlier chapter keeps the bare name) and find-replaced within that chapter.
+  Labels are PROACTIVELY slug-prefixed per chapter with the whole ref family
+  rewritten. Citations are merged + deduped into one bib (keys NOT prefixed);
+  exact-duplicate entries collapse; same-key-different-work gets a slug-rename with
+  `\cite` uses find-replaced.
+- Directory mirroring. Each source => `contents/<slug>/`, mirroring the source tree
+  verbatim (sub-tex, figures, local `.sty` like `quiver.sty`). Entry file =>
+  `contents/<slug>/main.tex` with the preamble and document-wrapper stripped.
+  Relative paths are rewritten (`\input{intro}` => `\input{contents/<slug>/intro}`,
+  `\includegraphics{foo.jpg}` => `contents/<slug>/foo.jpg`). No sectioning demotion
+  (papers top out at `\section`).
+- Per-paper frontmatter => chapter. `\maketitle`/`\title`/`\date`/inner
+  `\tableofcontents` removed; `\begin{abstract}` kept as `\section*{Abstract}` at
+  chapter top; `\author` dropped as a macro BUT coauthorship preserved as a FLAGGED
+  chapter footnote; trailing `\bibliography` removed (keys flow to the merged bib).
+'''
 formula = "mol-latex-concat"
-version = 1
+version = 2
+
+[requires]
+formula_compiler = ">=2.0.0"
 
 [vars]
 [vars.sources]
@@ -75,203 +130,311 @@ description = "Destination project directory. Empty creates a fresh blank merged
 required = false
 default = ""
 
+[vars.tex_engine]
+description = "TeX engine for the compile gate: pdflatex (default), xelatex, or lualatex. Used for both the per-source baseline and the final merged build."
+required = false
+default = "pdflatex"
+
 [[steps]]
 id = "inspect"
-title = "Inspect sources and infer entry/slug/title per paper"
-description = """
-Understand every source document before touching anything.
+title = "Catalogue every source into plan.json; decide slugs/order/title (agent)"
+description = '''
+Understand every source BEFORE touching anything, and write the agent's decisions +
+a parsed inventory into the shared `plan.json` (the contract every later step reads).
 
-For each directory in `{{sources}}` (split on commas, preserve order — this is
-chapter order):
+**1. Identity + paths.**
+```bash
+set -uo pipefail
+: "${GC_AGENT:?GC_AGENT empty — harness did not inject identity; refuse}"
+PACK="{{.CityRoot}}/packs/latex-utils"; SCRIPTS="$PACK/assets/scripts"
+PLAN="${LATEX_CONCAT_PLAN:-${TMPDIR:-/tmp}/latex-concat/${GC_BEAD_ID:-adhoc}/plan.json}"
+export LATEX_CONCAT_PLAN="$PLAN"; mkdir -p "$(dirname "$PLAN")"
+```
 
-1. **Find the entry file** — the `.tex` containing `\\begin{document}`.
-   ```bash
-   grep -rl '\\\\begin{document}' <source-dir> --include='*.tex'
-   ```
-   If more than one matches (or none), FLAG it and pick the most plausible
-   master, noting the choice.
+**2. Catalogue every source -> plan.json (Tier 1 + Tier 2 flags).**
+```bash
+python3 "$SCRIPTS/inspect_sources.py" --plan "$PLAN" \
+  --sources "{{sources}}" --dest "{{dest}}" --engine "{{tex_engine}}"
+```
+`inspect_sources.py` seeds `plan.json` on first run (vars + a per-source slot in
+chapter order), then for each source parses the entry file (`\begin{document}`), the
+`\title`, the document class, the preamble (`\usepackage` + options, every
+`\newcommand`/`\DeclareMathOperator`/`\newtheorem`/`\def`, every `\label`), the
+includes/figures/local `.sty`, the `\author`s, and the bib backend. It SUGGESTS a
+slug per source and raises Tier-2 flags (exotic class, 0-or->1 `\begin{document}`,
+unparseable constructs) into `plan.json.flags[]`.
 
-2. **Derive a slug** — a short lowercase abbreviation of the paper, unique
-   across sources (e.g. `ahks`, `ptw`, `pid`). This namespaces renamed macros,
-   prefixed labels, and the chapter directory.
+**3. Review the agent decisions (JUDGMENT — Tier 3).** These are yours to set in
+`plan.json` (use `jq`/`python3 -c 'import planlib…'`; this IS the "agent decides"
+half of the contract, not prose editing):
+- Confirm chapter ORDER (== `sources` order) and each suggested `slug`; override any
+  unclear slug so it is short, lowercase, and unique.
+- Confirm each `entry_file` and inferred `title`; set `title_override` if the
+  `\title` is unsuitable for a chapter heading.
+- Read every flag: `jq '.flags[]' "$PLAN"`. RESOLVE blockers now — an `exotic-class`
+  flag (beamer/standalone/poster/letter) means this formula does NOT handle that
+  source: STOP and report rather than guess. For every other flag, record your
+  decision in its `resolution` field.
 
-3. **Read the title** — from `\\title{...}` in the entry file (may span lines).
-   This becomes the `\\chapter{}` title.
-
-4. **Catalog the preamble** — list every `\\usepackage` (with options), every
-   `\\newcommand`/`\\renewcommand`/`\\DeclareMathOperator`/`\\newtheorem`, every
-   `\\label`, every local `.sty`, and every included file / figure path.
-   Note `\\author`s (for the coauthorship footnote) and the bib backend
-   (`\\bibliography{...}` files vs `biblatex`).
-
-Write your findings to a working notes file (e.g. `/tmp/latex-concat-plan.md`)
-so later steps and `REPORT.md` can build on them. FLAG anything ambiguous;
-never guess silently.
-"""
+Close this step once `plan.json` holds the full inventory, final slugs/order, and no
+unresolved BLOCKER flag.
+'''
 metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
 
 [[steps]]
-id = "scaffold-dest"
-title = "Open or scaffold the destination project"
+id = "baseline-compile"
+title = "Per-source baseline gate — each source must compile standalone first"
 needs = ["inspect"]
-description = """
-Prepare the destination named by `{{dest}}`.
+description = '''
+Fail fast: a source that will not build on its own is the SOURCE's defect, not
+something to repair inside the merge. Gate every source before investing in the dest.
 
-**If `{{dest}}` is empty:** create a fresh blank project directory
-`merged-latex/` and initialize git in it.
+```bash
+set -uo pipefail
+PACK="{{.CityRoot}}/packs/latex-utils"; SCRIPTS="$PACK/assets/scripts"
+PLAN="${LATEX_CONCAT_PLAN:-${TMPDIR:-/tmp}/latex-concat/${GC_BEAD_ID:-adhoc}/plan.json}"
+while IFS= read -r d; do
+  echo "[baseline] $d"
+  python3 "$SCRIPTS/verify.py" --plan "$PLAN" --baseline --source "$d" --engine "{{tex_engine}}" \
+    || { echo "[baseline] FAIL: $d did not compile standalone"; exit 2; }
+done < <(jq -r '.sources[].dir' "$PLAN")
+```
+
+`verify.py --baseline` compiles one source with the chosen `tex_engine` (and its
+detected bib backend), sets `sources[].baseline_compiled`, and exits non-zero on the
+first source that will not build.
+
+If a source FAILS: read its printed log. If it is a genuine ENVIRONMENT gap (a
+missing TeX package the toolchain should provide), resolve the toolchain and re-run.
+If the SOURCE itself is broken, STOP and report — do not proceed into the merge.
+
+Close this step when every source has `baseline_compiled = true`.
+'''
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[steps.retry]
+max_attempts = 2
+on_exhausted = "hard_fail"
+
+[[steps]]
+id = "scaffold-dest"
+title = "Open or scaffold the destination; record its shape in plan.json (agent)"
+needs = ["baseline-compile"]
+description = '''
+Prepare the destination named by `{{dest}}` and record its shape in `plan.json.dest`
+so the transform/hoist/wire steps know what they are merging into.
+
+```bash
+set -uo pipefail
+PACK="{{.CityRoot}}/packs/latex-utils"; SCRIPTS="$PACK/assets/scripts"
+PLAN="${LATEX_CONCAT_PLAN:-${TMPDIR:-/tmp}/latex-concat/${GC_BEAD_ID:-adhoc}/plan.json}"
+```
+
+**If `{{dest}}` is empty (blank mode):** create a fresh project and `git init` it.
 ```bash
 mkdir -p merged-latex/contents
-cd merged-latex
-git init
+( cd merged-latex && git init -q )
 ```
-Create a minimal `main.tex` with `\\documentclass{report}`, a placeholder
-preamble block (to be filled by the hoist step), `\\begin{document}`,
-`\\tableofcontents`, and `\\end{document}`.
+Write a minimal `merged-latex/main.tex`: `\documentclass{report}`, a placeholder
+preamble block (the hoist step fills it), `\begin{document}`, `\tableofcontents`, and
+`\end{document}`. Record `dest.mode = "blank"`, `dir`, `document_class = "report"`,
+`master_tex = "main.tex"`, a `master_bib` name (e.g. `references.bib`), and the
+chapter-input idiom `\input{contents/<slug>/main}`.
 
-**If `{{dest}}` exists:** it is an established project (e.g. a UCSD
-`thesis-template` using `ucsddissertation.cls`). Do NOT overwrite its document
-class or master preamble — read and RESPECT them. Identify where chapters get
-`\\input` and where the master `\\bibliography` lives. The hoist/wire steps will
-merge into this existing preamble, not replace it.
+**If `{{dest}}` exists (existing mode):** it is an established project (e.g. a UCSD
+`thesis-template` on `ucsddissertation.cls`). Do NOT overwrite its class or master
+preamble — READ and RESPECT them. Record `dest.mode = "existing"`, `dir`,
+`document_class`, `master_tex`, its master `master_bib`, and the template's own
+chapter-input idiom (so wire-main mirrors it instead of inventing one).
 
-Record in your notes which mode you are in (blank vs existing) and the
-destination's document class.
-"""
+Use `jq`/`planlib` to write these into `plan.json.dest`. Close this step once
+`plan.json.dest` records the mode, dir, class, master tex/bib, and chapter idiom.
+'''
 metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
 
 [[steps]]
 id = "transform-sources"
-title = "Mirror each source into contents/<slug>/ and rewrite paths"
+title = "Mirror each source into contents/<slug>/, strip wrappers, rewrite paths"
 needs = ["scaffold-dest"]
-description = """
-For each source (in chapter order), copy its tree verbatim into
-`contents/<slug>/` of the destination, then transform the entry file.
+description = '''
+Move every source into the dest and reduce its entry file to a bare chapter body —
+both mechanical (Tier 1), driven by helpers over `plan.json`.
 
-1. **Mirror the tree.** Copy all sub-`.tex`, figures (jpg/jpeg/png/pdf), and
-   local style files (e.g. `quiver.sty`) into `contents/<slug>/`, preserving
-   the source's internal layout.
+```bash
+set -uo pipefail
+PACK="{{.CityRoot}}/packs/latex-utils"; SCRIPTS="$PACK/assets/scripts"
+PLAN="${LATEX_CONCAT_PLAN:-${TMPDIR:-/tmp}/latex-concat/${GC_BEAD_ID:-adhoc}/plan.json}"
+DEST="$(jq -r '.dest.dir' "$PLAN")"
+python3 "$SCRIPTS/rewrite_paths.py" --plan "$PLAN" --dest "$DEST"
+python3 "$SCRIPTS/extract_body.py" --plan "$PLAN" --dest "$DEST"
+```
 
-2. **Strip the entry file → `contents/<slug>/main.tex`.** Remove `\\documentclass`,
-   the entire preamble, `\\begin{document}`/`\\end{document}`, `\\maketitle`,
-   `\\title`/`\\date`, inner `\\tableofcontents`, and the trailing
-   `\\bibliography{...}`. KEEP the body. Convert `\\begin{abstract}...\\end{abstract}`
-   into `\\section*{Abstract}` at the top of the chapter body.
+- `rewrite_paths.py` copies each source tree verbatim into `contents/<slug>/` (sub-tex,
+  figures, local `.sty`) and rewrites relative `\input`/`\include`/`\subfile`/
+  `\includegraphics` to resolve from the dest root.
+- `extract_body.py` strips the entry file to `contents/<slug>/main.tex`: removes
+  `\documentclass`, the preamble, `\begin{document}`/`\end{document}`,
+  `\maketitle`/`\title`/`\date`, inner `\tableofcontents`, and the trailing
+  `\bibliography`; converts `\begin{abstract}` into `\section*{Abstract}`. No
+  sectioning demotion. If a source had multiple `\author`s it records a FLAGGED
+  coauthorship footnote.
 
-3. **Rewrite relative paths** so they resolve from the destination root:
-   - `\\input{intro}` → `\\input{contents/<slug>/intro}`
-   - `\\includegraphics{...}{foo.jpg}` → `contents/<slug>/foo.jpg`
-   - any `\\usepackage{quiver}` style local-`.sty` references stay resolvable
-     (note these for the hoist step).
-
-4. **Coauthorship footnote.** If the source had multiple `\\author`s, add a
-   FLAGGED `\\footnote` at the chapter start crediting the coauthors, and record
-   it in your notes for `REPORT.md`. Do not carry `\\author` as a macro.
-
-No sectioning demotion — papers top out at `\\section`, which sits correctly
-under a `\\chapter`.
-"""
+Read any new `plan.json` flags and RESOLVE them (e.g. a path it could not resolve to
+a mirrored file). Close this step when every source has `transformed = true` and a
+`chapter_main` recorded.
+'''
 metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
 
 [[steps]]
 id = "hoist-preamble"
-title = "Hoist preambles into one global preamble; resolve macro/label collisions"
+title = "Hoist all preambles into one global preamble (package union/dedup/flags)"
 needs = ["transform-sources"]
-description = """
+description = '''
 Build the single global preamble (blank dest) or merge into the existing master
-preamble (existing dest).
+preamble (existing dest) — packages only; macro/label collisions are the next step.
 
-1. **Packages.** Union all `\\usepackage` lines, dedup by package name. DROP
-   class-owned or conflicting packages: `geometry`, font/margin packages, and
-   anything the destination's document class already provides. Where the same
-   package is requested with CONFLICTING options, keep one and FLAG the
-   conflict in `REPORT.md`. Local `.sty` files (e.g. `quiver`) keep working from
-   their `contents/<slug>/` location.
+```bash
+set -uo pipefail
+PACK="{{.CityRoot}}/packs/latex-utils"; SCRIPTS="$PACK/assets/scripts"
+PLAN="${LATEX_CONCAT_PLAN:-${TMPDIR:-/tmp}/latex-concat/${GC_BEAD_ID:-adhoc}/plan.json}"
+DEST="$(jq -r '.dest.dir' "$PLAN")"
+python3 "$SCRIPTS/hoist_preamble.py" --plan "$PLAN" --dest "$DEST"
+```
 
-2. **Macros** (`\\newcommand` / `\\DeclareMathOperator` / `\\newtheorem` / …).
-   Hoist all. If two papers define the same name with an IDENTICAL body, keep
-   one. If they define it with DIFFERENT bodies, the EARLIER chapter keeps the
-   bare name; rename the LATER chapter's macro with a per-paper slug suffix
-   (e.g. `\\foo` → `\\foopid`) and find-replace its uses within that chapter's
-   files only. Never just comment out a colliding macro.
+`hoist_preamble.py` unions every `\usepackage`, dedups by name, and DROPS
+class-owned/layout packages (geometry, fonts, margins, anything the dest class
+already provides), recording `preamble.packages_hoisted[]` / `packages_dropped[]`.
+Where the SAME package is requested with CONFLICTING options it keeps one and raises a
+Tier-2 `option-conflict` flag — it does not silently pick.
 
-3. **Labels.** PROACTIVELY prefix every `\\label` in each chapter with the
-   chapter slug (e.g. `\\label{thm:main}` → `\\label{ahks:thm:main}`) and
-   find-replace every `\\ref`/`\\eqref`/`\\cref`/`\\autoref` to that label within
-   the chapter. This prevents cross-paper label clashes up front.
+RESOLVE every `option-conflict` flag (Tier 3): decide which options the merged
+document needs, edit the global preamble, and record the decision in the flag's
+`resolution`. Close this step when the global preamble is built and no option-conflict
+flag is left unresolved.
+'''
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
 
-Record every rename and dropped/flagged package in your notes.
-"""
+[[steps]]
+id = "resolve-collisions"
+title = "Resolve macro collisions; proactively slug-prefix labels and refs"
+needs = ["hoist-preamble"]
+description = '''
+Make the merged document's macros and labels collision-free, using the shared
+TeX-aware safe find-replace core (Tier 1, with Tier-2 flags for the hard cases).
+
+```bash
+set -uo pipefail
+PACK="{{.CityRoot}}/packs/latex-utils"; SCRIPTS="$PACK/assets/scripts"
+PLAN="${LATEX_CONCAT_PLAN:-${TMPDIR:-/tmp}/latex-concat/${GC_BEAD_ID:-adhoc}/plan.json}"
+DEST="$(jq -r '.dest.dir' "$PLAN")"
+python3 "$SCRIPTS/resolve_macros.py" --plan "$PLAN" --dest "$DEST"
+python3 "$SCRIPTS/prefix_labels.py" --plan "$PLAN" --dest "$DEST"
+```
+
+- `resolve_macros.py`: identical macro bodies collapse to one; DIVERGENT collisions =>
+  the EARLIER chapter keeps the bare name, the LATER chapter's macro gets a per-slug
+  suffix (`\foo` => `\foopid`) with its uses find-replaced in that chapter only.
+  Records `renames.macros[]`.
+- `prefix_labels.py`: every `\label{k}` => `\label{<slug>:k}`, with the FULL ref
+  family rewritten (`\ref \eqref \cref \Cref \autoref \pageref \nameref \labelcref
+  \vref \cpageref …`). Done proactively across all chapters. Records `renames.labels[]`.
+
+RESOLVE any Tier-2 flag (a macro it could not rewrite soundly, a custom/package-defined
+ref-like macro `prefix_labels.py` did not recognize): rewrite by hand and record the
+`resolution`. Close this step when macros and labels are collision-free.
+'''
 metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
 
 [[steps]]
 id = "merge-bib"
-title = "Merge and dedup all bibliographies into one thesis bib"
-needs = ["hoist-preamble"]
-description = """
-Collect every source's `.bib` into a single merged bibliography (e.g.
-`references.bib` in the blank dest, or the destination's existing master bib).
+title = "Merge and dedup all bibliographies into one"
+needs = ["resolve-collisions"]
+description = '''
+Collapse every source bibliography into one (Tier 1 parse/dedup/merge, Tier-2 flags
+for genuine key conflicts).
 
-- Bib keys are NOT slug-prefixed.
-- Collapse EXACT-duplicate entries (same key, same work) to one.
-- Where the SAME key refers to DIFFERENT works across papers, slug-rename the
-  colliding key in the later paper and find-replace its `\\cite{...}` uses within
-  that chapter.
-- Ensure the destination's `\\bibliography{...}` (or biblatex resource) points at
-  the merged bib. Per-paper trailing `\\bibliography` lines were already removed
-  in the transform step.
+```bash
+set -uo pipefail
+PACK="{{.CityRoot}}/packs/latex-utils"; SCRIPTS="$PACK/assets/scripts"
+PLAN="${LATEX_CONCAT_PLAN:-${TMPDIR:-/tmp}/latex-concat/${GC_BEAD_ID:-adhoc}/plan.json}"
+DEST="$(jq -r '.dest.dir' "$PLAN")"
+python3 "$SCRIPTS/merge_bib.py" --plan "$PLAN" --dest "$DEST"
+```
 
-Record every collapsed/renamed key in your notes.
-"""
+`merge_bib.py` concatenates every source `.bib` into the dest's merged bib, collapses
+EXACT-duplicate entries (same key, same work), and where the SAME key refers to
+DIFFERENT works slug-renames the later paper's key and find-replaces its `\cite` uses
+within that chapter (records `bib.*` + `renames.bib_keys[]`). Keys are NOT
+slug-prefixed wholesale. It supports bibtex (`\bibliography`) and biblatex/biber
+(`\addbibresource`), auto-detected; the dest's bibliography resource is pointed at the
+merged bib.
+
+RESOLVE any flagged same-key conflict or exotic `.bst` issue, then close this step.
+'''
 metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
 
 [[steps]]
 id = "wire-main"
-title = "Wire chapters into the master document"
+title = "Wire each source in as a chapter in the master document (agent)"
 needs = ["merge-bib"]
-description = """
-Edit the destination's `main.tex` so each source appears as a chapter, in the
-order given by `{{sources}}`:
+description = '''
+Edit the destination master so each source appears as a chapter, in `sources` order.
+This is agent work (it depends on the dest's structure), driven by `plan.json`.
 
-```latex
-\\chapter{<inferred or overridden title>}
-\\input{contents/<slug>/main}
+```bash
+set -uo pipefail
+PLAN="${LATEX_CONCAT_PLAN:-${TMPDIR:-/tmp}/latex-concat/${GC_BEAD_ID:-adhoc}/plan.json}"
+DEST="$(jq -r '.dest.dir' "$PLAN")"
+jq -r '.sources | sort_by(.index)[] | "\(.slug)\t\(.title_override // .title)"' "$PLAN"
 ```
 
-For an existing template, follow its established chapter-input idiom rather than
-inventing a new one. Ensure the master `\\bibliography{...}` (pointing at the
-merged bib) sits after the last chapter, and a single `\\tableofcontents` is
-present near the top. Allow a per-source title override if the inferred
-`\\title{}` is unsuitable (note any override).
-"""
+For each source, in order, add (using the dest's recorded `chapter_input_idiom`):
+```latex
+\chapter{<title_override or title>}
+\input{contents/<slug>/main}
+```
+For a BLANK dest, place these between `\tableofcontents` and `\end{document}`, with the
+master `\bibliography{...}` (or biblatex resource) after the last chapter. For an
+EXISTING template, follow its established chapter idiom and REPLACE its demo chapters
+rather than inventing a new structure. Ensure exactly one `\tableofcontents` near the
+top and the merged bibliography after the last chapter.
+
+Close this step when every source is wired as a chapter in `sources` order and the
+master points at the merged bib.
+'''
 metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
 
 [[steps]]
-id = "compile-verify"
-title = "Compile gate — HARD FAIL unless the build is clean"
+id = "verify"
+title = "Compile gate — HARD FAIL unless the merged build is clean"
 needs = ["wire-main"]
-description = """
-Run the shipped compile gate against the destination. This is a HARD GATE: do
-not proceed to reporting until it passes.
+description = '''
+Run the final compile gate against the destination. HARD GATE: do not proceed to
+reporting until it passes.
 
 ```bash
-# build-verify.sh ships in the latex-utils pack assets.
-bash <path-to>/latex-utils/assets/scripts/build-verify.sh <dest-dir> main.tex
+set -uo pipefail
+PACK="{{.CityRoot}}/packs/latex-utils"; SCRIPTS="$PACK/assets/scripts"
+PLAN="${LATEX_CONCAT_PLAN:-${TMPDIR:-/tmp}/latex-concat/${GC_BEAD_ID:-adhoc}/plan.json}"
+DEST="$(jq -r '.dest.dir' "$PLAN")"; ENTRY="$(jq -r '.dest.master_tex // "main.tex"' "$PLAN")"
+python3 "$SCRIPTS/verify.py" --plan "$PLAN" --final --dest "$DEST" --entry "$ENTRY" --engine "{{tex_engine}}"
 ```
 
-The script runs pdflatex (nonstopmode/halt-on-error) → bibtex over every citing
-aux → pdflatex ×2, then scans the log. It exits non-zero on any pdflatex error,
-undefined reference, undefined citation, or multiply-defined label.
+`verify.py --final` runs the chosen `tex_engine` (nonstopmode/halt-on-error) -> bibtex
+OR biblatex/biber over every citing aux -> re-runs to settle, then scans the log. It
+exits non-zero on any TeX error, undefined reference, undefined citation, or
+multiply-defined label.
 
-If it FAILS: read the printed log lines (and the `.log` directly if needed),
-fix the offending source — usually a missed path rewrite, an unhoisted macro, a
-label/citation collision, or a dropped-but-needed package — and re-run. Repeat
-until the gate passes cleanly. Do NOT silence warnings to pass the gate; fix the
-underlying cause.
+If it FAILS, the failure is your Tier-3 work: read the printed log lines (and the
+`.log` directly if needed) and fix the offending source — usually a missed path
+rewrite, an unhoisted/undefined macro, a label/citation collision, or a dropped-but-
+needed package. A `undefined control sequence` / `undefined reference` is exactly the
+backstop catching a construct a Tier-2 helper could not see. Re-run until clean. Do
+NOT silence warnings to pass the gate; fix the underlying cause.
 
-This formula assumes a complete toolchain; if `build-verify.sh` reports a
-missing tool/package, that is an environment prerequisite to resolve, not a
-source defect.
-"""
+This formula assumes a complete toolchain; a missing tool/package is an environment
+prerequisite to resolve, not a source defect. Close this step only on a clean build.
+'''
 metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
 
 [steps.retry]
@@ -280,41 +443,43 @@ on_exhausted = "hard_fail"
 
 [[steps]]
 id = "report-commit"
-title = "Write REPORT.md and commit the destination"
-needs = ["compile-verify"]
-description = """
-The tree compiles clean. Finalize.
+title = "Render REPORT.md from plan.json and commit the destination"
+needs = ["verify"]
+description = '''
+The tree compiles clean. Render the human review surface and finalize.
 
-1. **Write `REPORT.md`** at the destination root documenting, per chapter:
-   - source → `contents/<slug>/` mapping and inferred slug/title
-   - every renamed macro (with old/new name and reason)
-   - every slug-prefixed label namespace
-   - every dropped or option-conflicting package (FLAGGED)
-   - every collapsed/renamed bib key
-   - coauthorship footnotes added
-   - any ambiguity flagged during inspection
-   This is the human's review surface — be specific.
+```bash
+set -uo pipefail
+PACK="{{.CityRoot}}/packs/latex-utils"; SCRIPTS="$PACK/assets/scripts"
+PLAN="${LATEX_CONCAT_PLAN:-${TMPDIR:-/tmp}/latex-concat/${GC_BEAD_ID:-adhoc}/plan.json}"
+DEST="$(jq -r '.dest.dir' "$PLAN")"
+python3 "$SCRIPTS/write_report.py" --plan "$PLAN" --dest "$DEST"
+cp "$PLAN" "$DEST/.latex-concat-plan.json"   # audit trail beside REPORT.md
+```
 
-2. **Commit in the destination** (no push):
-   ```bash
-   cd <dest-dir>
-   git add -A
-   git commit -m "latex-concat: merge <N> papers into thesis"
-   ```
-   For a blank dest this is the first commit on the freshly `git init`ed repo;
-   for an existing repo it is a normal commit on its current branch. Do NOT
-   `git push`.
+`write_report.py` renders `<dest>/REPORT.md` from the accumulated `plan.json`: per
+chapter, the source -> `contents/<slug>/` mapping and slug/title; every renamed macro;
+every slug-prefixed label namespace; every dropped/option-conflicting package; every
+collapsed/renamed bib key; coauthorship footnotes; and EVERY Tier-2 flag with its
+resolution. Skim it for completeness — it is the human's review surface.
 
-3. **Close the formula step.** If `GC_BEAD_ID` is set, close it with a summary:
-   ```bash
-   if [ -n "${GC_BEAD_ID:-}" ]; then
-     bd update "$GC_BEAD_ID" --set-metadata gc.outcome=pass --status=closed \\
-       --notes "Concatenated <N> papers into <dest>; clean compile; committed (no push). See REPORT.md."
-   fi
-   ```
+**Commit in the destination (no push):**
+```bash
+( cd "$DEST" && git add -A && git commit -q -m "latex-concat: merge $(jq '.sources|length' "$PLAN") papers into thesis" )
+```
+For a blank dest this is the first commit on the freshly `git init`ed repo; for an
+existing repo it is a normal commit on its current branch. Do NOT `git push`.
 
-**Exit criteria:** destination compiles clean via `build-verify.sh`, `REPORT.md`
-documents all transformations, the result is committed (not pushed), and the
-formula step is closed.
-"""
+**Close the formula step.** If `GC_BEAD_ID` is set:
+```bash
+if [ -n "${GC_BEAD_ID:-}" ]; then
+  gc bd update "$GC_BEAD_ID" --set-metadata gc.outcome=pass --status=closed \
+    --notes "Concatenated $(jq '.sources|length' "$PLAN") papers into $DEST; clean compile; committed (no push). See REPORT.md."
+fi
+```
+
+Exit criteria: dest compiles clean via `verify.py --final`, `REPORT.md` + the
+`plan.json` audit copy document every transformation and flag resolution, the result
+is committed (not pushed), and the formula step is closed.
+'''
 metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }

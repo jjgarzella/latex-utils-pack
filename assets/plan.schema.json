@@ -1,0 +1,261 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/jjgarzella/latex-utils-pack/plan.schema.json",
+  "title": "mol-latex-concat plan.json",
+  "description": "The agent<->script contract for the mol-latex-concat formula. The inspect step seeds it; every later helper READS and EXTENDS it; write_report.py renders REPORT.md from it. One file on disk, shared across the formula's single session. Helpers are testable in isolation: feed a plan.json + sources, assert the extended plan.json. Objects are deliberately open (additionalProperties:true) so a downstream helper may add fields without a schema bump; only the load-bearing keys are required.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "formula", "vars", "sources", "flags", "log"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "description": "Schema contract version. Bump on a breaking shape change.",
+      "const": "1"
+    },
+    "formula": {
+      "type": "string",
+      "const": "mol-latex-concat"
+    },
+    "vars": {
+      "type": "object",
+      "description": "The formula vars as resolved for this run (echoed so helpers and the report are self-contained).",
+      "additionalProperties": true,
+      "required": ["sources", "tex_engine"],
+      "properties": {
+        "sources": {
+          "type": "array",
+          "description": "Ordered list of source document directories. Order == chapter order.",
+          "items": { "type": "string" }
+        },
+        "dest": {
+          "type": "string",
+          "description": "Destination project dir. Empty string => a fresh blank merged-latex/ is created."
+        },
+        "tex_engine": {
+          "type": "string",
+          "description": "TeX engine for the compile gate.",
+          "enum": ["pdflatex", "xelatex", "lualatex"]
+        }
+      }
+    },
+    "dest": {
+      "type": "object",
+      "description": "The destination project, as decided by the scaffold step.",
+      "additionalProperties": true,
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["blank", "existing"],
+          "description": "blank => freshly created report-class merged-latex/; existing => merge into an established project, respecting its class/preamble."
+        },
+        "dir": { "type": "string", "description": "Absolute or run-relative path to the destination project root." },
+        "document_class": { "type": "string", "description": "The destination master document class (e.g. report, ucsddissertation)." },
+        "class_options": { "type": "array", "items": { "type": "string" } },
+        "master_tex": { "type": "string", "description": "Master .tex filename relative to dest.dir (default main.tex)." },
+        "master_bib": { "type": "string", "description": "Merged bibliography filename the master cites." },
+        "bib_backend": { "type": "string", "enum": ["bibtex", "biblatex"], "description": "Destination bib backend (auto-detected / inherited)." },
+        "chapter_input_idiom": { "type": "string", "description": "How a chapter is wired into the master (e.g. \"\\input{contents/<slug>/main}\"); for an existing template, mirror its established idiom." }
+      }
+    },
+    "sources": {
+      "type": "array",
+      "description": "Per-source inventory, index-aligned with vars.sources (chapter order). Seeded by inspect_sources.py; extended in place by the transform / verify steps.",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["index", "dir", "slug"],
+        "properties": {
+          "index": { "type": "integer", "description": "0-based position == chapter order." },
+          "dir": { "type": "string", "description": "Source directory as given in vars.sources." },
+          "slug": { "type": "string", "description": "Short unique lowercase abbreviation (e.g. ahks, ptw, pid). Namespaces renamed macros, prefixed labels, the chapter dir." },
+          "title": { "type": "string", "description": "From the source \\title{...}; becomes the \\chapter{} title (unless overridden in wire-main)." },
+          "title_override": { "type": ["string", "null"], "description": "Human/agent override for the chapter title when the inferred \\title is unsuitable." },
+          "entry_file": { "type": "string", "description": "The .tex containing \\begin{document}, relative to dir." },
+          "document_class": { "type": "string" },
+          "class_options": { "type": "array", "items": { "type": "string" } },
+          "tex_engine": { "type": "string", "enum": ["pdflatex", "xelatex", "lualatex"], "description": "Per-source engine hint (e.g. fontspec => xelatex/lualatex). The run-wide var wins for the merged compile; a mismatch is a flag." },
+          "bib_backend": { "type": "string", "enum": ["bibtex", "biblatex"], "description": "Detected: \\bibliography{} => bibtex; \\usepackage{biblatex}/\\addbibresource => biblatex." },
+          "bib_files": { "type": "array", "items": { "type": "string" }, "description": ".bib files this source pulls in." },
+          "packages": {
+            "type": "array",
+            "description": "Every \\usepackage in the preamble.",
+            "items": {
+              "type": "object",
+              "additionalProperties": true,
+              "required": ["name"],
+              "properties": {
+                "name": { "type": "string" },
+                "options": { "type": "array", "items": { "type": "string" } }
+              }
+            }
+          },
+          "macros": {
+            "type": "array",
+            "description": "Every macro-defining command in the preamble.",
+            "items": {
+              "type": "object",
+              "additionalProperties": true,
+              "required": ["name", "kind"],
+              "properties": {
+                "name": { "type": "string", "description": "The control sequence, e.g. \\F." },
+                "kind": { "type": "string", "description": "newcommand | renewcommand | providecommand | DeclareMathOperator | newtheorem | def | let | ..." },
+                "nargs": { "type": ["integer", "null"] },
+                "default_arg": { "type": ["string", "null"] },
+                "body": { "type": ["string", "null"], "description": "Definition body, used to decide identical-vs-divergent collisions." }
+              }
+            }
+          },
+          "labels": { "type": "array", "items": { "type": "string" }, "description": "Every \\label key defined in this source." },
+          "includes": { "type": "array", "items": { "type": "string" }, "description": "Targets of \\input/\\include/\\subfile, relative to dir." },
+          "figures": { "type": "array", "items": { "type": "string" }, "description": "\\includegraphics targets / graphics files under dir." },
+          "local_sty": { "type": "array", "items": { "type": "string" }, "description": "Local style files shipped beside the source (e.g. quiver.sty)." },
+          "authors": { "type": "array", "items": { "type": "string" }, "description": "\\author entries; >1 => a flagged coauthorship chapter footnote." },
+          "baseline_compiled": { "type": ["boolean", "null"], "description": "Set by verify.py --baseline: did this source compile standalone? null until checked." },
+          "transformed": { "type": ["boolean", "null"], "description": "Set by the transform step once mirrored+stripped into the dest." },
+          "chapter_main": { "type": ["string", "null"], "description": "Destination path of the stripped chapter body, e.g. contents/<slug>/main.tex." }
+        }
+      }
+    },
+    "preamble": {
+      "type": "object",
+      "description": "Hoist results, written by hoist_preamble.py.",
+      "additionalProperties": true,
+      "properties": {
+        "packages_hoisted": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": ["name"],
+            "properties": {
+              "name": { "type": "string" },
+              "options": { "type": "array", "items": { "type": "string" } },
+              "from_slugs": { "type": "array", "items": { "type": "string" }, "description": "Which sources requested it (provenance for the report)." }
+            }
+          }
+        },
+        "packages_dropped": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": ["name", "reason"],
+            "properties": {
+              "name": { "type": "string" },
+              "reason": { "type": "string", "description": "e.g. class-owned by dest, geometry/font/margin conflict." },
+              "from_slugs": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        }
+      }
+    },
+    "renames": {
+      "type": "object",
+      "description": "Every namespacing rewrite, for the report and for re-derivation. Written by resolve_macros.py, prefix_labels.py, merge_bib.py.",
+      "additionalProperties": true,
+      "properties": {
+        "macros": {
+          "type": "array",
+          "description": "Divergent-collision macro renames (earlier chapter keeps the bare name; later gets a slug suffix).",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": ["slug", "from", "to"],
+            "properties": {
+              "slug": { "type": "string" },
+              "from": { "type": "string" },
+              "to": { "type": "string" },
+              "reason": { "type": "string" }
+            }
+          }
+        },
+        "labels": {
+          "type": "array",
+          "description": "Proactive per-chapter \\label slug-prefixing (and the matching ref-family rewrites).",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": ["slug", "from", "to"],
+            "properties": {
+              "slug": { "type": "string" },
+              "from": { "type": "string" },
+              "to": { "type": "string" }
+            }
+          }
+        },
+        "bib_keys": {
+          "type": "array",
+          "description": "same-key-different-work bib renames (later paper's key gets a slug suffix; \\cite uses rewritten).",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": ["slug", "from", "to"],
+            "properties": {
+              "slug": { "type": "string" },
+              "from": { "type": "string" },
+              "to": { "type": "string" },
+              "reason": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "bib": {
+      "type": "object",
+      "description": "Bibliography merge log, written by merge_bib.py.",
+      "additionalProperties": true,
+      "properties": {
+        "merged_bib": { "type": "string", "description": "Path of the single merged .bib in the dest." },
+        "backend": { "type": "string", "enum": ["bibtex", "biblatex"] },
+        "entries_total": { "type": "integer" },
+        "duplicates_collapsed": {
+          "type": "array",
+          "description": "Exact-duplicate entries (same key, same work) folded to one.",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": ["key"],
+            "properties": {
+              "key": { "type": "string" },
+              "from_slugs": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        }
+      }
+    },
+    "flags": {
+      "type": "array",
+      "description": "The Tier-2 'flag-and-defer, never guess' channel. A helper that meets a construct it cannot soundly transform appends a flag here instead of guessing; the agent (Tier 3) resolves each and fills `resolution`. write_report.py surfaces every flag in REPORT.md. The compile gate is the backstop for anything a helper missed.",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["id", "tier", "stage", "kind", "message"],
+        "properties": {
+          "id": { "type": "string", "description": "Stable id, e.g. F1, F2 (so resolutions can reference it)." },
+          "tier": { "type": "integer", "enum": [1, 2, 3], "description": "Tier of the construct that triggered the flag (usually 2)." },
+          "severity": { "type": "string", "enum": ["info", "warn", "blocker"], "description": "blocker => must be resolved before the compile gate can pass." },
+          "stage": { "type": "string", "description": "Which step raised it: inspect | baseline | scaffold | transform | hoist | resolve | merge-bib | wire | verify." },
+          "slug": { "type": ["string", "null"], "description": "Source slug it concerns, or null for cross-source flags (e.g. an option conflict)." },
+          "kind": { "type": "string", "description": "Machine tag, e.g. exotic-class | multiple-entry-files | option-conflict | custom-ref-macro | same-key-different-work | engine-mismatch | exotic-bst." },
+          "message": { "type": "string", "description": "Human-readable description of what was deferred and why." },
+          "location": { "type": ["string", "null"], "description": "file:line or file the flag points at." },
+          "resolution": { "type": ["string", "null"], "description": "Filled by the agent (Tier 3): what it decided/did. null == unresolved." }
+        }
+      }
+    },
+    "log": {
+      "type": "array",
+      "description": "Append-only step log; the spine of REPORT.md.",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["step", "summary"],
+        "properties": {
+          "step": { "type": "string" },
+          "ts": { "type": ["string", "null"], "description": "UTC ISO-8601 timestamp." },
+          "summary": { "type": "string" }
+        }
+      }
+    }
+  }
+}
