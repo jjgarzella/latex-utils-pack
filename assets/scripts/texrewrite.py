@@ -219,18 +219,30 @@ def rename_csname(text: str, old_full: str, new_full: str, spans=None, limit: in
 # Reference-family key rewriting (\label / \ref / \cref / \hyperref[...] / …).   #
 # --------------------------------------------------------------------------- #
 
-# Single-brace-argument reference commands (key, or comma-list of keys, in {…}).
-# \label is included so the *definition* sites are prefixed by the same machinery.
-BRACE_REF_COMMANDS = {
+# Single-LABEL brace commands: the WHOLE brace content is ONE key, even when it
+# contains a comma (label names may legitimately contain commas/spaces, e.g.
+# \label{Main theorem, introduction}; \ref reads the brace verbatim). These must
+# NEVER be comma-split. \label is here so the *definition* sites prefix identically
+# to their \ref uses.
+SINGLE_KEY_BRACE_COMMANDS = {
     "label",
     "ref", "eqref", "pageref", "nameref", "autoref", "autopageref",
-    "cref", "Cref", "cpageref", "Cpageref", "namecref", "nameCref", "Namecref",
-    "labelcref", "labelcpageref",
     "vref", "Vref", "vpageref", "Vpageref", "fullref", "vrefpagenum",
     "thmref", "lemref", "secref", "figref", "tabref", "eqnref", "appref",
-    "zref", "zcref", "zcpageref", "zpageref", "zvref",
-    "smartref", "fancyref", "Aref", "Acup",
+    "zref", "zpageref", "zvref",
+    "smartref", "fancyref", "Aref",
 }
+
+# Multi-key (comma-LIST) brace commands: cleveref & friends accept {a,b,c}. A key in
+# such a list cannot itself contain a comma, so splitting on commas is sound here.
+LIST_KEY_BRACE_COMMANDS = {
+    "cref", "Cref", "cpageref", "Cpageref", "namecref", "nameCref", "Namecref",
+    "labelcref", "labelcpageref",
+    "zcref", "zcpageref", "Acup",
+}
+
+# All single-brace-argument reference commands (kept for back-compat / detection).
+BRACE_REF_COMMANDS = SINGLE_KEY_BRACE_COMMANDS | LIST_KEY_BRACE_COMMANDS
 
 # Two-brace-argument *range* commands (\crefrange{a}{b}); both keys are rewritten.
 RANGE_REF_COMMANDS = {
@@ -242,14 +254,23 @@ RANGE_REF_COMMANDS = {
 BRACKET_REF_COMMANDS = {"hyperref"}
 
 
+def _norm_key(s: str) -> str:
+    """Normalise a label/reference key the way TeX tokenisation does: trim the ends
+    and collapse every internal run of whitespace (incl. the newline+indent of a key
+    split across lines, e.g. ``\\label{Closed ideals are\\n  closed}``) to a single
+    space, so a multi-line ``\\label`` and its single-line ``\\ref`` map to one key."""
+    return re.sub(r"\s+", " ", s.strip())
+
+
 def _map_keys(content: str, map_key) -> tuple:
-    """Rewrite a comma-list of reference keys with ``map_key``; return
+    """Rewrite a comma-LIST of reference keys with ``map_key`` (for the cleveref
+    family, where ``{a,b,c}`` is genuinely several keys). Return
     ``(new_content, n_changed)``. Whitespace around each key is preserved."""
     parts = content.split(",")
     changed = 0
     new_parts = []
     for p in parts:
-        stripped = p.strip()
+        stripped = _norm_key(p)
         mapped = map_key(stripped) if stripped else stripped
         if mapped != stripped:
             changed += 1
@@ -260,6 +281,22 @@ def _map_keys(content: str, map_key) -> tuple:
         else:
             new_parts.append(p)
     return ",".join(new_parts), changed
+
+
+def _map_single(content: str, map_key) -> tuple:
+    """Rewrite ONE reference key (the entire brace content of a single-label command
+    such as ``\\label``/``\\ref``) with ``map_key`` — NOT comma-split, because the key
+    may itself contain commas. Return ``(new_content, n_changed)``. Insignificant
+    outer whitespace is dropped only when the key actually changes (so the rewritten
+    key matches the canonical, identically-stripped form recorded by find_labels);
+    an unchanged key is preserved verbatim."""
+    key = _norm_key(content)
+    if not key:
+        return content, 0
+    mapped = map_key(key)
+    if mapped != key:
+        return mapped, 1
+    return content, 0
 
 
 def rewrite_refs(text: str, map_key, *, brace_cmds=None, range_cmds=None,
@@ -275,6 +312,9 @@ def rewrite_refs(text: str, map_key, *, brace_cmds=None, range_cmds=None,
     brace_cmds = BRACE_REF_COMMANDS if brace_cmds is None else set(brace_cmds)
     range_cmds = RANGE_REF_COMMANDS if range_cmds is None else set(range_cmds)
     bracket_cmds = BRACKET_REF_COMMANDS if bracket_cmds is None else set(bracket_cmds)
+    # Of the brace commands, only the cleveref-family ones take a comma-list; the rest
+    # (\label, \ref, …) are single keys that may contain commas.
+    list_cmds = LIST_KEY_BRACE_COMMANDS & brace_cmds
 
     all_cmds = brace_cmds | range_cmds | bracket_cmds
     if not all_cmds:
@@ -289,10 +329,15 @@ def rewrite_refs(text: str, map_key, *, brace_cmds=None, range_cmds=None,
         cmd = m.group(1)
         i = skip_ws(text, m.end())
         try:
+            # A command whose brace holds a comma-LIST (cleveref family) is split on
+            # commas; everything else (\label, \ref, … and each brace of a range
+            # command) is ONE key that may itself contain commas — never split.
+            list_keyed = cmd in list_cmds
+            map_arg = _map_keys if list_keyed else _map_single
             if cmd in bracket_cmds and i < len(text) and text[i] == "[":
                 content, end = bracket_arg(text, i)
                 open_pos = i  # text[open_pos] == '['
-                new_content, ch = _map_keys(content or "", map_key)
+                new_content, ch = map_arg(content or "", map_key)
                 out.append(text[cur:open_pos + 1])
                 out.append(new_content)
                 cur = end - 1  # the closing ']' is re-emitted next
@@ -305,7 +350,7 @@ def rewrite_refs(text: str, map_key, *, brace_cmds=None, range_cmds=None,
                     if j >= len(text) or text[j] != "{":
                         break
                     content, end = brace_arg(text, j)
-                    new_content, ch = _map_keys(content or "", map_key)
+                    new_content, ch = map_arg(content or "", map_key)
                     out.append(text[cur:j + 1])
                     out.append(new_content)
                     cur = end - 1  # closing '}' re-emitted next
@@ -334,10 +379,11 @@ def find_labels(text: str, spans=None):
             content, _ = brace_arg(text, m.end() - 1)
         except ParseError:
             continue
-        for k in (content or "").split(","):
-            k = k.strip()
-            if k and k not in out:
-                out.append(k)
+        # \label takes ONE key: the whole brace content (which may contain commas);
+        # collapse internal whitespace so a key split across lines matches its \ref.
+        k = _norm_key(content or "")
+        if k and k not in out:
+            out.append(k)
     return out
 
 

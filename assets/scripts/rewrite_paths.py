@@ -152,22 +152,41 @@ def read_bracket(s: str, i: int):
 # Mirroring.                                                                    #
 # --------------------------------------------------------------------------- #
 
-def _skip_file(name: str) -> bool:
-    return name.endswith(AUX_SUFFIXES)
+# VCS metadata that can also appear as a FILE (a git submodule's ``.git`` is a
+# gitlink file, not a directory): never mirror it, or the dest commit would treat
+# the chapter dir as a nested repo/submodule instead of tracking its files.
+SKIP_FILES = {".git", ".svn", ".hg", ".gitmodules", ".DS_Store"}
+
+
+def _skip_file(name: str, dir_tex_bases: set = frozenset()) -> bool:
+    """Skip LaTeX build artifacts, VCS metadata files, and a compiled ``<base>.pdf``/
+    ``.synctex.gz``/``.xdv`` whose ``<base>.tex`` lives beside it (a build OUTPUT, not a
+    figure — figure PDFs have no same-named .tex)."""
+    if name in SKIP_FILES or name.endswith(AUX_SUFFIXES):
+        return True
+    base, ext = os.path.splitext(name)
+    if ext.lower() in (".pdf", ".xdv") and base in dir_tex_bases:
+        return True
+    if name.endswith(".synctex.gz") and name[:-len(".synctex.gz")] in dir_tex_bases:
+        return True
+    return False
 
 
 def mirror_source(src_abs: str, mirror_abs: str) -> int:
     """Copy the source tree verbatim into ``mirror_abs`` (overwriting), skipping VCS
-    dirs and LaTeX build artifacts. Returns the number of files copied. Existing files
-    are overwritten so the rewrite below always starts from pristine source text."""
+    dirs/files and LaTeX build artifacts. Returns the number of files copied. Existing
+    files are overwritten so the rewrite below always starts from pristine source text."""
     n = 0
     for root, dirs, files in os.walk(src_abs):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
         rel = os.path.relpath(root, src_abs)
         dest_root = mirror_abs if rel == "." else os.path.join(mirror_abs, rel)
         os.makedirs(dest_root, exist_ok=True)
+        # basenames of the .tex files in THIS dir, so a same-named .pdf (the compiled
+        # output) is recognised as an artifact and skipped.
+        tex_bases = {os.path.splitext(f)[0] for f in files if f.endswith(".tex")}
         for f in files:
-            if _skip_file(f):
+            if _skip_file(f, tex_bases):
                 continue
             try:
                 shutil.copy2(os.path.join(root, f), os.path.join(dest_root, f))

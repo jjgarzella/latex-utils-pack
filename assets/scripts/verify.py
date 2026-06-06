@@ -198,14 +198,20 @@ def run_biber(cwd: str):
     return (not errs), errs
 
 
-def scan_log(log: str) -> list:
-    """Scan the engine .log for fatal warnings pdflatex exits 0 on."""
+def scan_log(log: str, ignore_labels=()) -> list:
+    """Scan the engine .log for fatal warnings pdflatex exits 0 on.
+
+    `ignore_labels` is a set of FATAL_PHRASES *labels* to skip — the baseline
+    gate uses it to downgrade a source's own multiply-defined labels (it still
+    built standalone; the duplicate is a merge concern the final gate enforces)."""
     try:
         lines = read_text(log).splitlines()
     except OSError:
         return ["engine log not found: %s" % log]
     problems = []
     for phrase, label in FATAL_PHRASES:
+        if label in ignore_labels:
+            continue
         hits = [ln.strip() for ln in lines if phrase in ln]
         if hits:
             problems.append("%s:" % label)
@@ -230,9 +236,14 @@ def scan_biber_citations(cwd: str) -> list:
     return problems
 
 
-def compile_and_gate(project_dir: str, entry: str, engine: str):
+def compile_and_gate(project_dir: str, entry: str, engine: str, lenient_labels: bool = False):
     """Compile `entry` in `project_dir` with `engine`, run the detected bib
     backend, settle over three passes, then scan the logs.
+
+    `lenient_labels` (baseline mode): a source that produces a PDF but carries its
+    own multiply-defined labels still COMPILES STANDALONE — the duplicate is a
+    merge-quality issue that prefix_labels flags and the FINAL gate enforces in the
+    dest, not a reason to refuse the source. The final gate keeps lenient_labels=False.
 
     Returns (exit_code, problems, backend):
       0 clean · 1 missing tool (environment) · 2 failed the gate.
@@ -274,9 +285,14 @@ def compile_and_gate(project_dir: str, entry: str, engine: str):
     if not os.path.isfile(pdf):
         return EXIT_GATE, ["no %s.pdf produced" % jobname], backend
 
-    problems = scan_log(log)
+    soft = {"multiply-defined labels present"} if lenient_labels else set()
+    problems = scan_log(log, ignore_labels=soft)
     if backend == "biblatex":
         problems += scan_biber_citations(project_dir)
+    if soft and "There were multiply-defined labels" in read_text(log):
+        print("verify: (baseline) NOTE — source has multiply-defined label(s); the paper "
+              "still builds standalone, so baseline is not failing on it. prefix_labels "
+              "flags it and the final merge gate enforces uniqueness in the dest.")
 
     return (EXIT_GATE if problems else EXIT_OK), problems, backend
 
@@ -415,7 +431,7 @@ def do_baseline(plan_path, source_dir, engine_override, entry_override):
     engine = resolve_engine(engine_override, plan, src_obj)
 
     print("verify: baseline compile of %s — entry=%s engine=%s" % (source_dir, entry, engine))
-    code, problems, backend = compile_and_gate(source_dir, entry, engine)
+    code, problems, backend = compile_and_gate(source_dir, entry, engine, lenient_labels=True)
 
     if plan is not None and src_obj is not None:
         if not src_obj.get("entry_file"):

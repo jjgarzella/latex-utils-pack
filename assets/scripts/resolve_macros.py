@@ -146,6 +146,14 @@ def _is_env(rec) -> bool:
     return rec.get("kind") in ENV_KINDS
 
 
+def _cskey(name: str) -> str:
+    """Normalise a definition's name to the bare control-sequence it occupies, so the
+    two namespaces line up: a macro is catalogued WITH its backslash (``\\alg``) but an
+    environment WITHOUT (``alg``), yet ``\\newtheorem{alg}`` and ``\\newcommand{\\alg}``
+    both define the control sequence ``\\alg`` and therefore clash."""
+    return (name or "").lstrip("\\")
+
+
 def _signature(rec, verbatim, is_env) -> str:
     """A definition signature for the identical-vs-divergent decision. Environments
     compare on their verbatim text (their `\\end` code is not in the parsed record);
@@ -261,7 +269,11 @@ def main(argv=None):
 
     sources = sorted(plan.get("sources", []), key=lambda e: e.get("index", 0))
 
-    seen = {}          # (is_env, name) -> {"sig", "idx", "slug"}
+    # Keyed by the bare control-sequence NAME, because \newtheorem{X}/\newenvironment{X}
+    # define the control sequence \X just like \newcommand{\X} does — an env name and a
+    # macro name in different chapters genuinely clash on \X (e.g. \newtheorem{alg} vs
+    # \newcommand{\alg}). Unifying the namespace here is what lets that be detected.
+    seen = {}          # name -> {"sig", "idx", "slug", "is_env", "kind"}
     emit = []          # ordered verbatim definitions for the global preamble
     rename_records = []
     hoisted = []       # report summary
@@ -286,11 +298,12 @@ def main(argv=None):
             if not name:
                 continue
             is_env = _is_env(rec)
-            key = (is_env, name)
+            key = _cskey(name)  # the control sequence this def occupies (\X), namespace-unified
             sig = _signature(rec, verbatim, is_env)
 
             if key not in seen:
-                seen[key] = {"sig": sig, "idx": idx, "slug": slug}
+                seen[key] = {"sig": sig, "idx": idx, "slug": slug, "is_env": is_env,
+                             "kind": rec.get("kind")}
                 emit.append(verbatim)
                 hoisted.append({"name": name, "kind": rec.get("kind"), "slug": slug,
                                 "action": "hoisted"})
@@ -306,15 +319,25 @@ def main(argv=None):
                                 "action": "collapsed", "into_slug": seen[key]["slug"]})
                 continue
 
-            # Divergent cross-source collision.
+            # Divergent cross-source collision on the control sequence \name.
             canon = seen[key]["slug"]
+            canon_is_env = seen[key]["is_env"]
             if is_env:
+                # The LATER definition is an environment: renaming an env (its
+                # \begin/\end and shared counters) is out of scope — flag and defer,
+                # whether the canonical owner was an env or a plain macro of the name.
+                if canon_is_env:
+                    msg = ("Environment %r is defined differently by chapter %r and chapter "
+                           "%r; renaming an environment (its \\begin/\\end and counters) is "
+                           "not auto-done — keep one and reconcile the other by hand."
+                           % (name, canon, slug))
+                else:
+                    msg = ("Environment %r in chapter %r clashes with the control sequence "
+                           "\\%s already defined as a macro by chapter %r; renaming an "
+                           "environment is not auto-done — reconcile by hand."
+                           % (name, slug, name, canon))
                 planlib.add_flag(plan, tier=2, stage="resolve", kind="divergent-env-collision",
-                                 severity="warn", slug=slug,
-                                 message=("Environment %r is defined differently by chapter %r "
-                                          "and chapter %r; renaming an environment (its "
-                                          "\\begin/\\end and counters) is not auto-done — keep "
-                                          "one and reconcile the other by hand." % (name, canon, slug)),
+                                 severity="warn", slug=slug, message=msg,
                                  location=chapter_dir or None)
                 hoisted.append({"name": name, "kind": rec.get("kind"), "slug": slug,
                                 "action": "deferred"})
@@ -343,10 +366,13 @@ def main(argv=None):
                                 "action": "deferred"})
                 continue
 
-            # Safe divergent rename: \foo -> \foo<suffix>.
+            # Safe divergent rename: \foo -> \foo<suffix>. This also resolves a later
+            # command that clashes with an earlier ENVIRONMENT's control sequence
+            # (e.g. ptw's \newcommand{\alg} vs ahks's \newtheorem{alg}) — renaming the
+            # plain command is sound; the environment keeps the bare name.
             new_name = name + _macro_suffix(slug)
-            existing_cs = {k[1] for k in seen if not k[0]}
-            if new_name in existing_cs or any(r["to"] == new_name for r in rename_records):
+            existing_cs = set(seen.keys())  # every control-sequence key already claimed
+            if _cskey(new_name) in existing_cs or any(r["to"] == new_name for r in rename_records):
                 planlib.add_flag(plan, tier=2, stage="resolve", kind="macro-suffix-collision",
                                  severity="warn", slug=slug,
                                  message=("Wanted to rename %s -> %s for chapter %r but that name "
@@ -360,13 +386,15 @@ def main(argv=None):
             emit.append(renamed_def)
             if chapter_dir and os.path.isdir(chapter_dir):
                 _rewrite_uses(chapter_dir, name, new_name)
+            reason = ("clash with environment %r defined by chapter %r" % (name, canon)
+                      if canon_is_env else "divergent macro collision with chapter %r" % canon)
             rename_records.append({
-                "slug": slug, "from": name, "to": new_name,
-                "reason": "divergent macro collision with chapter %r" % canon,
+                "slug": slug, "from": name, "to": new_name, "reason": reason,
             })
             hoisted.append({"name": name, "kind": rec.get("kind"), "slug": slug,
                             "action": "renamed", "to": new_name})
-            seen[(False, new_name)] = {"sig": sig, "idx": idx, "slug": slug}
+            seen[_cskey(new_name)] = {"sig": sig, "idx": idx, "slug": slug, "is_env": False,
+                                      "kind": rec.get("kind")}
 
     plan["renames"]["macros"] = rename_records
     plan["preamble"]["macros_hoisted"] = hoisted

@@ -268,6 +268,62 @@ def _write_block(master_path: str, block: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Local style files: a source that ships its own .sty (e.g. quiver.sty) needs it #
+# at the dest ROOT, because the hoisted \usepackage runs from the master before  #
+# any chapter \input, when only the dest root + texmf trees are on the path.     #
+# --------------------------------------------------------------------------- #
+
+def _copy_local_styles(plan, sources, dest_dir):
+    """Copy each source's local style/class/def files (recorded by inspect as
+    ``local_sty``) from its mirror ``contents/<slug>/`` up to the dest root, so the
+    hoisted ``\\usepackage`` resolves and the merged project is self-contained. Same
+    bytes already present => skip; a DIFFERENT same-named file from another source =>
+    Tier-2 flag (never silently clobber). Returns the list of copied basenames."""
+    if not dest_dir:
+        return []
+    copied = []
+    seen = {}  # basename -> (slug, abspath) of the first copy that landed at root
+    for s in sources:
+        slug = s.get("slug") or ""
+        styles = s.get("local_sty") or []
+        if not (slug and styles):
+            continue
+        chap = os.path.join(dest_dir, "contents", slug)
+        for name in styles:
+            src = os.path.join(chap, name)
+            if not os.path.isfile(src):  # find it deeper in the mirror if not at top
+                for root, _d, files in os.walk(chap):
+                    if name in files:
+                        src = os.path.join(root, name)
+                        break
+            if not os.path.isfile(src):
+                continue
+            dst = os.path.join(dest_dir, name)
+            try:
+                new_bytes = open(src, "rb").read()
+                if os.path.isfile(dst) and open(dst, "rb").read() == new_bytes:
+                    if name not in seen:
+                        seen[name] = (slug, dst)
+                    continue
+                if name in seen and open(seen[name][1], "rb").read() != new_bytes:
+                    planlib.add_flag(
+                        plan, tier=2, stage="hoist", kind="local-style-conflict",
+                        slug=slug, severity="warn",
+                        message=("Two chapters ship a DIFFERENT '%s'; kept %s's copy at the "
+                                 "dest root. Reconcile by hand if both are needed."
+                                 % (name, seen[name][0])),
+                        location="contents/%s/%s" % (slug, name))
+                    continue
+                with open(dst, "wb") as fh:
+                    fh.write(new_bytes)
+                seen[name] = (slug, dst)
+                copied.append(name)
+            except OSError as e:
+                sys.stderr.write("[hoist] WARN could not copy local style %s: %s\n" % (src, e))
+    return copied
+
+
+# --------------------------------------------------------------------------- #
 # Driver.                                                                       #
 # --------------------------------------------------------------------------- #
 
@@ -405,6 +461,7 @@ def main(argv=None):
 
     # ---- Emit the block on disk. ------------------------------------------- #
     wrote = False
+    copied_styles = []
     fatal_config = (not dest_dir) or (not master_exists)
     block = _render_block(hoisted, len(dropped), len(sources))
     if not dest_dir:
@@ -420,6 +477,9 @@ def main(argv=None):
                          slug=None, severity="blocker", location=master_path)
     else:
         wrote = _write_block(master_path, block)
+        # Drop any local .sty a source ships at the dest root so the merged project
+        # is self-contained (the hoisted \usepackage runs before any chapter \input).
+        copied_styles = _copy_local_styles(plan, sources, dest_dir)
         # A master with no anchor at all is suspicious enough to surface.
         with open(master_path, "r", encoding="utf-8", errors="replace") as fh:
             if not BEGIN_DOC_RE.search(_mask_comments(fh.read())):
@@ -432,11 +492,14 @@ def main(argv=None):
                      if f.get("stage") == "hoist" and f.get("kind") == "option-conflict")
     planlib.add_log(
         plan, "hoist",
-        "Hoisted %d package(s), dropped %d (class-owned/duplicate); %d option-conflict flag(s).%s"
+        "Hoisted %d package(s), dropped %d (class-owned/duplicate); %d option-conflict flag(s).%s%s"
         % (len(hoisted), len(dropped), n_conflict,
            " Wrote global preamble block to %s." % master_path if wrote else
-           (" Master unchanged (%s)." % master_path if master_exists else ""))
+           (" Master unchanged (%s)." % master_path if master_exists else ""),
+           " Copied local style file(s) to dest root: %s." % ", ".join(copied_styles)
+           if copied_styles else "")
     )
+    plan.setdefault("preamble", {})["local_styles_copied"] = copied_styles
 
     try:
         planlib.validate(plan)
