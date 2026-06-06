@@ -1,35 +1,758 @@
 #!/usr/bin/env python3
-"""merge_bib — concat/dedup every source bibliography into one. STUB.
+"""merge_bib — concat/dedup every source bibliography into ONE merged .bib.
 
-Tier 1 (parse/dedup/merge) + Tier 2 (flag-and-defer). Owner: pt-nni (T6).
-Part of the mol-latex-concat formula (latex-utils pack).
+Tier 1 (parse/dedup/merge — sound in general) + Tier 2 (flag-and-defer). Owner:
+pt-nni (T6). Part of the mol-latex-concat formula (latex-utils pack). Runs in the
+`merge-bib` step, AFTER the transform step has mirrored each source into
+`<dest>/contents/<slug>/` (so the source `.bib` files and the chapter `.tex` whose
+`\\cite` uses we may rewrite are already on disk in the dest).
 
-Reads  plan.json: sources[].bib_files/bib_backend/slug.
-Writes the merged .bib + plan.json bib.*: concat all entries, COLLAPSE exact
-       duplicates (same key, same work) to one; where the SAME key refers to
-       DIFFERENT works, slug-rename the later paper's key and find-replace its
-       \\cite uses within that chapter (recorded in renames.bib_keys). Keys are NOT
-       slug-prefixed wholesale. Supports bibtex (\\bibliography) and biblatex/biber
-       (\\addbibresource), auto-detected. Tier-2 flag exotic .bst weirdness and any
-       same-key conflict it cannot resolve mechanically.
+Reads  plan.json: sources[].slug / bib_backend / bib_files (chapter order); dest.dir /
+       master_bib / bib_backend. The source `.bib` files are read from the mirror
+       (`<dest>/contents/<slug>/<bib_file>`), falling back to the original source dir.
+Writes the single merged `.bib` at `<dest>/<master_bib>` (default `references.bib`) and
+       extends plan.json: `bib.*` (merged path, backend, entry count, collapsed dups),
+       `renames.bib_keys[]`, and rewrites the renamed keys' `\\cite` uses in the owning
+       chapter's mirrored `.tex` files.
+
+Merge protocol (across sources, in chapter order — mirrors resolve_macros.py):
+  * the FIRST source to define a citation key is canonical and KEEPS the bare key;
+  * a later source whose entry under that key is byte-identical (modulo whitespace /
+    field order) is an EXACT duplicate and COLLAPSES into the canonical one;
+  * a later source whose entry under that key is a DIFFERENT work gets a per-slug key
+    suffix (`smith2020` => `smith2020:pid`); the renamed entry is emitted alongside the
+    canonical one and every `\\cite` use in THAT chapter is find-replaced. Recorded in
+    `renames.bib_keys[]`. Keys are NOT slug-prefixed wholesale — only true collisions move.
+
+Backends: bibtex (`\\bibliography`) and biblatex/biber (`\\addbibresource`) are both
+supported; the `.bib` entry syntax is the same for either, so all entries fold into one
+file. The merged backend is `dest.bib_backend` if set, else the sources' (a disagreement
+is a Tier-2 `mixed-bib-backend` flag — never silently picked). `@string` / `@preamble`
+definitions are carried over (deduped); `@comment` blocks are dropped.
+
+`\\cite`-family rewriting is sound over the well-behaved subset (reusing texrewrite's
+protected-region mask so a `\\cite` inside a comment / verbatim is never touched) and
+covers the standard + natbib + biblatex single-keylist commands, honouring their optional
+`[prenote][postnote]` arguments. biblatex MULTICITE commands (`\\cites{a}{b}…`, whose
+several key groups the single-keylist rewriter cannot read soundly) are NOT rewritten —
+when a chapter that has a renamed key also uses one, it is Tier-2 flagged for the agent.
+
+Tier-2 flags (flag-and-defer, NEVER guess): same-key-different-work (the auto-rename,
+surfaced for the human to confirm the two entries really are different works); a `.bib`
+that will not parse; a declared bib file missing on disk; a mixed source backend; a
+multicite in a chapter with renamed keys; a chapter dir missing for a needed `\\cite`
+rewrite; an existing dest bibliography that was overwritten. The compile gate (undefined
+citation) is the backstop for anything missed.
+
+Mechanical soundness / idempotency: the merged `.bib` is regenerated from scratch each
+run (deterministic), and merge_bib never reads its OWN previously-generated output back
+in (it is marked with a header comment and ignored as a pre-existing dest bib). The
+`\\cite` rewrite re-derives the same renames every run; once a chapter's keys are renamed
+on disk a re-run simply finds nothing left to rewrite. Re-runs reproduce the same plan.
 
 CLI:
-  merge_bib.py --plan PLAN --dest DIR
+  merge_bib.py --plan PLAN [--dest DIR]
 """
+
+from __future__ import annotations
+
 import argparse
+import os
+import re
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import planlib  # noqa: E402
+import texrewrite  # noqa: E402  (protected_spans / brace_arg / bracket_arg / skip_ws)
+
+STAGE = "merge-bib"
+
+# First line of every merged .bib we write, so a re-run recognises (and ignores) its
+# own output rather than folding it back in as a "pre-existing" dest bibliography.
+GENERATED_MARKER = ("% mol-latex-concat: merged bibliography generated by merge_bib.py — "
+                    "do not hand-edit (regenerated each run).")
+
+# Flag kinds this helper owns (cleared and re-derived on every idempotent re-run). Each
+# is unique to merge_bib so the reset never clobbers another helper's flags.
+MY_FLAG_KINDS = {
+    "same-key-different-work", "unparseable-bib", "bib-file-missing",
+    "bib-files-inferred", "mixed-bib-backend", "complex-cite",
+    "cite-chapter-dir-missing", "dest-bib-overwritten", "no-bibliographies",
+    "duplicate-key-in-source",
+}
+
+SKIP_DIRS = {".git", ".svn", ".hg", "node_modules", "__pycache__", ".gc"}
+
+
+# --------------------------------------------------------------------------- #
+# BibTeX parsing — sound over the well-behaved subset; a malformed entry is     #
+# skipped and reported (Tier-2 flagged by the caller), never guessed at.        #
+# --------------------------------------------------------------------------- #
+
+class BibParseError(Exception):
+    """A construct could not be read soundly. Raised by the low-level scanners and
+    caught inside parse_bib, which skips the offending entry and reports it rather
+    than discarding the whole file — the caller Tier-2 flags any skips."""
+
+
+# An entry head: @type followed by '{' or '(' (bibtex accepts either delimiter).
+ENTRY_HEAD_RE = re.compile(r"@([A-Za-z]+)\s*([{(])")
+_FIELD_NAME_RE = re.compile(r"[A-Za-z0-9_\-.:+/]+")
+_BARE_VALUE_RE = re.compile(r"[^,#}\s]+")
+
+
+def _scan_group(s: str, i: int):
+    """``s[i]`` is ``{`` or ``(``; return ``(inner, index_past_close)``. For a brace
+    group, braces are matched literally (as BibTeX does). For a paren-delimited entry the
+    close is the first ``)`` at brace-depth 0 and outside a ``"…"`` string."""
+    open_ch = s[i]
+    n = len(s)
+    if open_ch == "{":
+        depth, j = 0, i
+        while j < n:
+            c = s[j]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    return s[i + 1:j], j + 1
+            j += 1
+        raise BibParseError("unterminated brace group")
+    # paren-delimited entry
+    depth, in_q, j = 0, False, i + 1
+    while j < n:
+        c = s[j]
+        if in_q:
+            if c == '"':
+                in_q = False
+            elif c == "{":
+                depth += 1
+            elif c == "}" and depth > 0:
+                depth -= 1
+            j += 1
+            continue
+        if c == '"' and depth == 0:
+            in_q = True
+        elif c == "{":
+            depth += 1
+        elif c == "}" and depth > 0:
+            depth -= 1
+        elif c == ")" and depth == 0:
+            return s[i + 1:j], j + 1
+        j += 1
+    raise BibParseError("unterminated paren group")
+
+
+def _scan_quote(s: str, i: int):
+    """``s[i]`` is ``"``; return ``(inner, index_past_close)`` honouring nested braces (a
+    ``"`` inside ``{…}`` is literal, per BibTeX)."""
+    n = len(s)
+    depth, j = 0, i + 1
+    while j < n:
+        c = s[j]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            if depth > 0:
+                depth -= 1
+        elif c == '"' and depth == 0:
+            return s[i + 1:j], j + 1
+        j += 1
+    raise BibParseError("unterminated quoted value")
+
+
+def _norm(v: str) -> str:
+    """Collapse whitespace for the exact-duplicate comparison (formatting-insensitive)."""
+    return re.sub(r"\s+", " ", v).strip()
+
+
+def _read_key(body: str):
+    """Read the citation key from an entry body (text after ``{``). Returns
+    ``(key, start, end)`` where start/end locate the stripped key within ``body``."""
+    depth = 0
+    cut = len(body)
+    for idx, c in enumerate(body):
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth = max(0, depth - 1)
+        elif c == "," and depth == 0:
+            cut = idx
+            break
+    seg = body[:cut]
+    start = len(seg) - len(seg.lstrip())
+    stripped = seg.strip()
+    return stripped, start, start + len(stripped)
+
+
+def _parse_fields(rest: str):
+    """Parse ``, name = value, …`` into a normalised ``{name(lower): value}`` map for the
+    exact-duplicate comparison. Raises BibParseError on a structurally broken field."""
+    fields = {}
+    i, n = 0, len(rest)
+    while i < n:
+        while i < n and rest[i] in " \t\r\n,":
+            i += 1
+        if i >= n:
+            break
+        m = _FIELD_NAME_RE.match(rest, i)
+        if not m:
+            break  # trailing junk before the close; the entry's fields end here
+        name = m.group(0).lower()
+        i = m.end()
+        while i < n and rest[i] in " \t\r\n":
+            i += 1
+        if i >= n or rest[i] != "=":
+            raise BibParseError("expected '=' after field %r" % name)
+        i += 1
+        parts = []
+        while True:
+            while i < n and rest[i] in " \t\r\n":
+                i += 1
+            if i >= n:
+                break
+            c = rest[i]
+            if c == "{":
+                inner, i = _scan_group(rest, i)
+                parts.append(inner)
+            elif c == '"':
+                inner, i = _scan_quote(rest, i)
+                parts.append(inner)
+            else:
+                vm = _BARE_VALUE_RE.match(rest, i)
+                if not vm:
+                    break
+                parts.append(vm.group(0))
+                i = vm.end()
+            while i < n and rest[i] in " \t\r\n":
+                i += 1
+            if i < n and rest[i] == "#":  # string concatenation -> read the next piece
+                i += 1
+                continue
+            break
+        fields[name] = _norm("".join(parts))
+    return fields
+
+
+def parse_bib(text: str):
+    """Parse a .bib into ``(items, errors)``. Each item is a dict with ``kind`` in
+    {entry, string, preamble, comment}, ``type`` (lowercased), ``key`` (entries only),
+    ``raw`` (verbatim ``@…`` text), ``key_start``/``key_end`` (key span within ``raw``),
+    and ``sig`` (the same-work signature). Resilient: an entry whose group cannot be read
+    soundly is recorded in ``errors`` and skipped (the rest of the file is still parsed)
+    rather than discarding the whole file — the caller Tier-2 flags any errors."""
+    items, errors = [], []
+    i, n = 0, len(text)
+    while i < n:
+        m = ENTRY_HEAD_RE.search(text, i)
+        if not m:
+            break
+        etype = m.group(1).lower()
+        open_pos = m.end() - 1
+        try:
+            body, past = _scan_group(text, open_pos)
+        except BibParseError as e:
+            errors.append("%s near offset %d (%s)" % (etype, m.start(), e))
+            i = m.end()  # skip this malformed head and resume at the next entry
+            continue
+        raw = text[m.start():past]
+        body_off = open_pos + 1 - m.start()
+
+        if etype in ("string", "preamble", "comment"):
+            items.append({"kind": etype, "type": etype, "key": None, "raw": raw,
+                          "key_start": None, "key_end": None, "sig": None})
+            i = past
+            continue
+
+        key, ks, ke = _read_key(body)
+        try:
+            fields = _parse_fields(body[ke:])
+        except BibParseError:
+            fields = None
+        if fields is not None:
+            sig = ("F", etype, tuple(sorted(fields.items())))
+        else:
+            sig = ("R", etype, _norm(body[ke:]))  # field parse failed: compare raw bodies
+        items.append({"kind": "entry", "type": etype, "key": key, "raw": raw,
+                      "key_start": body_off + ks, "key_end": body_off + ke, "sig": sig})
+        i = past
+    return items, errors
+
+
+# --------------------------------------------------------------------------- #
+# \cite-family rewriting (reuses texrewrite's protected-region mask).           #
+# --------------------------------------------------------------------------- #
+
+# Single-keylist cite commands: the (optionally starred) head, any ``[prenote][postnote]``
+# optional args, then ONE ``{key,key,…}`` group. Standard + natbib + biblatex.
+SINGLE_CITE_CMDS = {
+    "cite", "nocite", "Cite",
+    "citet", "citep", "citealt", "citealp", "citeauthor", "citeyear",
+    "citeyearpar", "citefullauthor", "citenum", "citetalias", "citepalias",
+    "Citet", "Citep", "Citealt", "Citealp", "Citeauthor",
+    "textcite", "parencite", "footcite", "footcitetext", "autocite", "smartcite",
+    "supercite", "fullcite", "footfullcite", "citetitle", "citedate", "citeurl",
+    "notecite", "pnotecite", "fnotecite",
+    "Textcite", "Parencite", "Footcite", "Autocite", "Smartcite", "Citetitle",
+}
+# Multicite commands: several key groups in one call — NOT rewritten (flag instead).
+MULTI_CITE_CMDS = {
+    "cites", "Cites", "parencites", "Parencites", "textcites", "Textcites",
+    "footcites", "Footcites", "autocites", "Autocites", "smartcites", "Smartcites",
+    "supercites", "fullcites",
+}
+_ALL_CITE = sorted(SINGLE_CITE_CMDS | MULTI_CITE_CMDS, key=len, reverse=True)
+CITE_HEAD_RE = re.compile(
+    r"\\(" + "|".join(re.escape(c) for c in _ALL_CITE) + r")(\*?)(?![A-Za-z@])")
+
+
+def _in_spans(pos: int, spans) -> bool:
+    for a, b in spans:
+        if a <= pos < b:
+            return True
+        if pos < a:
+            break
+    return False
+
+
+def _map_keylist(content: str, mapping):
+    """Rewrite a comma-list of citation keys via ``mapping``; return ``(new, n_changed)``,
+    preserving whitespace around each key."""
+    out, changed = [], 0
+    for p in content.split(","):
+        s = p.strip()
+        repl = mapping.get(s, s)
+        if repl != s:
+            changed += 1
+            lead = p[: len(p) - len(p.lstrip())]
+            trail = p[len(p.rstrip()):]
+            out.append(lead + repl + trail)
+        else:
+            out.append(p)
+    return ",".join(out), changed
+
+
+def rewrite_cites(text: str, mapping, spans=None):
+    """Rewrite renamed citation keys (``mapping`` old->new) across the cite family, outside
+    protected regions. Returns ``(new_text, n_keys_rewritten, saw_multicite)``."""
+    if spans is None:
+        spans = texrewrite.protected_spans(text)
+    out, cur, total, saw_multi = [], 0, 0, False
+    for m in CITE_HEAD_RE.finditer(text):
+        if m.start() < cur or _in_spans(m.start(), spans):
+            continue
+        cmd = m.group(1)
+        if cmd in MULTI_CITE_CMDS:
+            saw_multi = True
+            continue
+        try:
+            i = texrewrite.skip_ws(text, m.end())
+            for _ in range(2):  # up to two optional [prenote][postnote] arguments
+                if i < len(text) and text[i] == "[":
+                    _, i = texrewrite.bracket_arg(text, i)
+                    i = texrewrite.skip_ws(text, i)
+                else:
+                    break
+            if i >= len(text) or text[i] != "{":
+                continue
+            content, end = texrewrite.brace_arg(text, i)
+        except texrewrite.ParseError:
+            # malformed argument: leave it untouched, let the compile gate surface it
+            continue
+        new_content, ch = _map_keylist(content or "", mapping)
+        if ch:
+            out.append(text[cur:i + 1])
+            out.append(new_content)
+            cur = end - 1  # the closing '}' is re-emitted on the next slice
+            total += ch
+    out.append(text[cur:])
+    return "".join(out), total, saw_multi
+
+
+# --------------------------------------------------------------------------- #
+# Plan / filesystem helpers (mirror the sibling helpers).                       #
+# --------------------------------------------------------------------------- #
+
+def _save_my_flags(plan, kinds):
+    return {(f.get("kind"), f.get("slug"), f.get("message")): f
+            for f in plan.get("flags", []) if f.get("kind") in kinds}
+
+
+def _stabilize_my_flag_ids(plan, kinds, saved):
+    """Reuse a recurring flag's prior id + agent resolution; mint the next free ``Fn``
+    for a new one. Other helpers' flag ids are left untouched."""
+    flags = plan.get("flags", [])
+    used = {f["id"] for f in flags if f.get("kind") not in kinds and f.get("id")}
+
+    def fresh():
+        n = 1
+        while ("F%d" % n) in used:
+            n += 1
+        used.add("F%d" % n)
+        return "F%d" % n
+
+    for f in flags:
+        if f.get("kind") not in kinds:
+            continue
+        prev = saved.get((f.get("kind"), f.get("slug"), f.get("message")))
+        if prev and prev.get("id") and prev["id"] not in used:
+            f["id"] = prev["id"]
+            used.add(prev["id"])
+        else:
+            f["id"] = fresh()
+        if prev and prev.get("resolution") is not None and not f.get("resolution"):
+            f["resolution"] = prev["resolution"]
+
+
+def _dest_dir(plan, dest_arg):
+    d = dest_arg or plan.get("dest", {}).get("dir") or ""
+    return os.path.abspath(d) if d else ""
+
+
+def _read(path):
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        return fh.read()
+
+
+def _chapter_tex_files(chapter_dir):
+    out = []
+    for root, dirs, files in os.walk(chapter_dir):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        for f in files:
+            if f.endswith(".tex"):
+                out.append(os.path.join(root, f))
+    return sorted(out)
+
+
+def _find_bib(name, roots):
+    """Resolve a declared bib file (relative to a source root) to an on-disk path, trying
+    each root in order and a ``.bib`` suffix for backends that omit it."""
+    for r in roots:
+        cand = os.path.join(r, name)
+        if os.path.isfile(cand):
+            return cand
+        if not name.endswith(".bib") and os.path.isfile(cand + ".bib"):
+            return cand + ".bib"
+    return None
+
+
+def _glob_bib(root):
+    out = []
+    for dirpath, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        for f in files:
+            if f.endswith(".bib"):
+                out.append(os.path.join(dirpath, f))
+    return sorted(out)
+
+
+def _resolve_bib_files(source, dest_dir):
+    """Locate a source's `.bib` files. Prefer the mirror (`<dest>/contents/<slug>/`) so we
+    operate on the dest's self-contained copy; fall back to the original source dir.
+    Returns ``(found_abs_paths, missing_declared, inferred)``."""
+    slug = source.get("slug") or ""
+    src = source.get("dir") or ""
+    src_abs = src if os.path.isabs(src) else os.path.abspath(src)
+    mirror = os.path.join(dest_dir, "contents", slug) if slug else ""
+    roots = [r for r in (mirror, src_abs) if r and os.path.isdir(r)]
+    primary = roots[0] if roots else None
+
+    found, missing, seen = [], [], set()
+    for name in (source.get("bib_files") or []):
+        hit = _find_bib(name, roots)
+        if hit:
+            real = os.path.realpath(hit)
+            if real not in seen:
+                seen.add(real)
+                found.append(hit)
+        else:
+            missing.append(name)
+
+    inferred = False
+    if not source.get("bib_files") and source.get("bib_backend") and primary:
+        for p in _glob_bib(primary):
+            real = os.path.realpath(p)
+            if real not in seen:
+                seen.add(real)
+                found.append(p)
+        inferred = bool(found)
+    return found, missing, inferred
+
+
+def _unique_key(base_key, slug, used):
+    cand = "%s:%s" % (base_key, slug)
+    if cand not in used:
+        return cand
+    n = 2
+    while ("%s%d" % (cand, n)) in used:
+        n += 1
+    return "%s%d" % (cand, n)
+
+
+# --------------------------------------------------------------------------- #
+# Driver.                                                                       #
+# --------------------------------------------------------------------------- #
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="merge and dedup bibliographies (STUB)")
-    ap.add_argument("--plan", help="path to plan.json (the agent<->script contract)")
-    ap.add_argument("--dest", help="destination project directory")
-    ap.parse_known_args(argv)
+    ap = argparse.ArgumentParser(description="merge and dedup all source bibliographies into one")
+    ap.add_argument("--plan", required=True, help="path to plan.json (the agent<->script contract)")
+    ap.add_argument("--dest", default="", help="destination project dir (default: plan.dest.dir)")
+    args = ap.parse_args(argv)
+
+    if not os.path.exists(args.plan):
+        sys.stderr.write("merge_bib: plan.json not found: %s\n" % args.plan)
+        return 2
+    plan = planlib.load(args.plan)
+
+    dest_dir = _dest_dir(plan, args.dest)
+    if not dest_dir or not os.path.isdir(dest_dir):
+        sys.stderr.write("merge_bib: destination dir not found: %r\n" % dest_dir)
+        return 2
+
+    # Idempotent re-run: drop this helper's prior flags and rebuild its plan output,
+    # remembering stable ids + agent resolutions to re-apply after re-derivation.
+    saved_flags = _save_my_flags(plan, MY_FLAG_KINDS)
+    plan["flags"] = [f for f in plan.get("flags", []) if f.get("kind") not in MY_FLAG_KINDS]
+    plan.setdefault("renames", {})["bib_keys"] = []
+
+    sources = sorted(plan.get("sources", []), key=lambda e: e.get("index", 0))
+
+    # --- determine the merged backend ---------------------------------------- #
+    src_backends = [s.get("bib_backend") for s in sources if s.get("bib_backend")]
+    distinct = sorted(set(src_backends))
+    backend = plan.get("dest", {}).get("bib_backend")
+    if not backend:
+        backend = distinct[0] if len(distinct) == 1 else (src_backends[0] if src_backends else "bibtex")
+    if len(distinct) > 1:
+        planlib.add_flag(plan, tier=2, stage=STAGE, kind="mixed-bib-backend", severity="warn",
+                         slug=None,
+                         message=("Sources disagree on bibliography backend (%s); the merged "
+                                  "document uses a single backend (%s). Confirm the master "
+                                  "uses one backend and adjust the cite commands accordingly."
+                                  % (", ".join(distinct), backend)))
+
+    # --- parse + merge all source bibs (chapter order) ----------------------- #
+    registry = {}          # key -> {"sig", "slug"} of the canonical holder
+    used_keys = set()
+    output = []            # ordered: {"raw", "ks", "ke", "emit_key"}
+    string_emit, preamble_emit = [], []
+    seen_string, seen_preamble = set(), set()
+    dup_from = {}          # key -> [slugs] that exact-duplicated it
+    rename_records = []
+    cite_map = {}          # slug -> {old_key: new_key}
+    bib_style = None
+
+    for source in sources:
+        slug = source.get("slug") or ""
+        if not source.get("bib_backend") and not source.get("bib_files"):
+            continue  # this source contributes no bibliography
+        if source.get("bib_style") and not bib_style:
+            bib_style = source.get("bib_style")
+
+        found, missing, inferred = _resolve_bib_files(source, dest_dir)
+        if missing:
+            planlib.add_flag(plan, tier=2, stage=STAGE, kind="bib-file-missing", severity="warn",
+                             slug=slug or None,
+                             message=("Declared bib file(s) not found for chapter %r: %s — their "
+                                      "entries are NOT in the merged bibliography."
+                                      % (slug, ", ".join(missing))))
+        if inferred:
+            planlib.add_flag(plan, tier=2, stage=STAGE, kind="bib-files-inferred", severity="info",
+                             slug=slug or None,
+                             message=("No bib file was declared for chapter %r; inferred %d *.bib "
+                                      "file(s) by scanning its dir: %s. Confirm these are the right "
+                                      "bibliographies." % (slug, len(found),
+                                                           ", ".join(os.path.basename(f) for f in found))))
+
+        for path in found:
+            items, errors = parse_bib(_read(path))
+            if errors:
+                planlib.add_flag(plan, tier=2, stage=STAGE, kind="unparseable-bib", severity="warn",
+                                 slug=slug or None,
+                                 message=("Skipped %d unparseable entr(y/ies) in %s — fold them "
+                                          "into the merged bibliography by hand: %s"
+                                          % (len(errors), os.path.relpath(path, dest_dir),
+                                             "; ".join(errors[:5]))),
+                                 location=os.path.relpath(path, dest_dir))
+
+            for it in items:
+                kind = it["kind"]
+                if kind == "string":
+                    nrm = _norm(it["raw"])
+                    if nrm not in seen_string:
+                        seen_string.add(nrm)
+                        string_emit.append(it["raw"])
+                    continue
+                if kind == "preamble":
+                    nrm = _norm(it["raw"])
+                    if nrm not in seen_preamble:
+                        seen_preamble.add(nrm)
+                        preamble_emit.append(it["raw"])
+                    continue
+                if kind == "comment":
+                    continue
+
+                key = it["key"]
+                if not key:
+                    continue
+                canon = registry.get(key)
+                if canon is None:
+                    registry[key] = {"sig": it["sig"], "slug": slug}
+                    used_keys.add(key)
+                    output.append({"raw": it["raw"], "ks": it["key_start"],
+                                   "ke": it["key_end"], "emit_key": key})
+                    continue
+                if it["sig"] == canon["sig"]:
+                    if canon["slug"] != slug:        # exact dup across chapters -> collapse
+                        dup_from.setdefault(key, [canon["slug"]])
+                        if slug not in dup_from[key]:
+                            dup_from[key].append(slug)
+                    continue                          # (same source repeating itself: drop)
+                if canon["slug"] == slug:
+                    planlib.add_flag(plan, tier=2, stage=STAGE, kind="duplicate-key-in-source",
+                                     severity="warn", slug=slug or None,
+                                     message=("Chapter %r defines key %r more than once with "
+                                              "differing entries; kept the first. Fix the source "
+                                              "bibliography." % (slug, key)))
+                    continue
+                # same key, different work -> rename the later chapter's key + its \cite uses
+                new_key = _unique_key(key, slug, used_keys)
+                used_keys.add(new_key)
+                registry[new_key] = {"sig": it["sig"], "slug": slug}
+                output.append({"raw": it["raw"], "ks": it["key_start"],
+                               "ke": it["key_end"], "emit_key": new_key})
+                rename_records.append({"slug": slug, "from": key, "to": new_key,
+                                       "reason": "same key as chapter %r but a different entry"
+                                                 % canon["slug"]})
+                cite_map.setdefault(slug, {})[key] = new_key
+                planlib.add_flag(plan, tier=2, stage=STAGE, kind="same-key-different-work",
+                                 severity="info", slug=slug or None,
+                                 message=("Key %r is used by chapter %r and chapter %r for "
+                                          "DIFFERENT works; auto-renamed the latter to %r and "
+                                          "rewrote its \\cite uses. Confirm they are genuinely "
+                                          "different (not a duplicate that should collapse)."
+                                          % (key, canon["slug"], slug, new_key)))
+
+    # --- rewrite renamed keys' \cite uses in the owning chapter -------------- #
+    n_cite_rewrites = 0
+    for slug, mapping in cite_map.items():
+        chapter_dir = os.path.join(dest_dir, "contents", slug)
+        if not os.path.isdir(chapter_dir):
+            planlib.add_flag(plan, tier=2, stage=STAGE, kind="cite-chapter-dir-missing",
+                             severity="warn", slug=slug or None,
+                             message=("Renamed %d bib key(s) for chapter %r but its mirrored dir "
+                                      "%s is missing — run the transform step first; the \\cite "
+                                      "uses were NOT rewritten (the compile gate will report them "
+                                      "as undefined citations)."
+                                      % (len(mapping), slug, os.path.join("contents", slug))),
+                             location=os.path.join("contents", slug))
+            continue
+        saw_multi = False
+        for f in _chapter_tex_files(chapter_dir):
+            try:
+                t = _read(f)
+            except OSError:
+                continue
+            new_t, n, multi = rewrite_cites(t, mapping)
+            saw_multi = saw_multi or multi
+            if n and new_t != t:
+                with open(f, "w", encoding="utf-8") as fh:
+                    fh.write(new_t)
+                n_cite_rewrites += n
+        if saw_multi:
+            planlib.add_flag(plan, tier=2, stage=STAGE, kind="complex-cite", severity="warn",
+                             slug=slug or None,
+                             message=("Chapter %r has renamed bib key(s) AND uses a biblatex "
+                                      "multicite command (\\cites/\\parencites/…) whose several "
+                                      "key groups are not auto-rewritten. Check those uses and "
+                                      "rewrite any renamed key by hand: %s"
+                                      % (slug, ", ".join("%s->%s" % (k, v) for k, v in mapping.items()))),
+                             location=os.path.join("contents", slug))
+
+    # --- write the merged .bib ----------------------------------------------- #
+    master_bib = plan.get("dest", {}).get("master_bib") or "references.bib"
+    merged_abs = os.path.join(dest_dir, master_bib)
+    merged_rel = os.path.relpath(merged_abs, dest_dir)
+    entries_total = len(output)
+
+    if entries_total == 0 and not string_emit and not preamble_emit:
+        planlib.add_flag(plan, tier=2, stage=STAGE, kind="no-bibliographies", severity="info",
+                         slug=None,
+                         message=("No bibliography entries were found across the sources; no merged "
+                                  "bibliography was written. If the sources cite nothing this is "
+                                  "expected; otherwise confirm their bib backend/files."))
+        plan["bib"] = {"backend": backend, "entries_total": 0, "duplicates_collapsed": []}
+    else:
+        # Don't fold our OWN previous output back in, but warn if a real pre-existing dest
+        # bibliography is about to be overwritten (the merged bib replaces it by design).
+        if os.path.isfile(merged_abs):
+            head = ""
+            try:
+                head = _read(merged_abs)
+            except OSError:
+                head = ""
+            if not head.startswith(GENERATED_MARKER) and ENTRY_HEAD_RE.search(head):
+                planlib.add_flag(plan, tier=2, stage=STAGE, kind="dest-bib-overwritten",
+                                 severity="warn", slug=None,
+                                 message=("The destination already had a bibliography at %s with "
+                                          "entries; it was OVERWRITTEN by the merged source "
+                                          "bibliography. If retained frontmatter cites those "
+                                          "entries, fold them into the sources or the merged bib."
+                                          % merged_rel),
+                                 location=merged_rel)
+
+        # One self-contained chunk per definition/entry, blank-line separated for
+        # readability (and so each entry unambiguously starts at a line boundary).
+        header = "%s\n%% Sources merged (chapter order): %s." % (
+            GENERATED_MARKER, ", ".join(s.get("slug") or "?" for s in sources) or "(none)")
+        chunks = [header]
+        chunks.extend(s.strip("\n") for s in string_emit)
+        chunks.extend(p.strip("\n") for p in preamble_emit)
+        for o in output:
+            raw = o["raw"]
+            if o["emit_key"] != raw[o["ks"]:o["ke"]]:
+                raw = raw[:o["ks"]] + o["emit_key"] + raw[o["ke"]:]
+            chunks.append(raw.strip("\n"))
+        os.makedirs(os.path.dirname(merged_abs) or ".", exist_ok=True)
+        with open(merged_abs, "w", encoding="utf-8") as fh:
+            fh.write("\n\n".join(chunks).rstrip("\n") + "\n")
+
+        plan["bib"] = {
+            "merged_bib": merged_rel,
+            "backend": backend,
+            "entries_total": entries_total,
+            "duplicates_collapsed": [{"key": k, "from_slugs": v} for k, v in sorted(dup_from.items())],
+        }
+        if bib_style and backend == "bibtex":
+            plan["bib"]["style"] = bib_style
+        # Convenience for wire-main: record where the merged bib lives / its backend.
+        plan.setdefault("dest", {})
+        plan["dest"].setdefault("master_bib", merged_rel)
+        plan["dest"].setdefault("bib_backend", backend)
+
+    plan["renames"]["bib_keys"] = rename_records
+    _stabilize_my_flag_ids(plan, MY_FLAG_KINDS, saved_flags)
+
+    n_dups = sum(len(v) - 1 for v in dup_from.values())
+    planlib.add_log(plan, STAGE,
+                    "Merged %d source bibliograph(ies) into %s (%s): %d entr(ies), %d exact "
+                    "duplicate(s) collapsed, %d same-key-different-work rename(s), %d \\cite "
+                    "rewrite(s)." % (len(src_backends), merged_rel, backend, entries_total,
+                                     n_dups, len(rename_records), n_cite_rewrites))
+
+    try:
+        planlib.validate(plan)
+    except Exception as e:
+        sys.stderr.write("merge_bib: plan.json failed schema validation: %s\n" % e)
+        planlib.save(args.plan, plan)
+        return 1
+
+    planlib.save(args.plan, plan)
     sys.stderr.write(
-        "STUB: merge_bib.py is not implemented yet (pt-nni / T6). "
-        "The mol-latex-concat DAG is wired to this stub; bib merge lands in T6.\n"
-    )
-    return 70  # EX_SOFTWARE: not implemented
+        "[merge-bib] wrote %s — %d entr(ies), %d dup(s) collapsed, %d rename(s), %d cite rewrite(s).\n"
+        % (merged_rel, entries_total, n_dups, len(rename_records), n_cite_rewrites))
+    return 0
 
 
 if __name__ == "__main__":
