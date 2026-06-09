@@ -388,10 +388,17 @@ DEST="$(jq -r '.dest.dir' "$PLAN")"
 jq -r '.sources | sort_by(.index)[] | "\(.slug)\t\(.title_override // .title)"' "$PLAN"
 ```
 
-For each source, in order, add (using the dest's recorded `chapter_input_idiom`):
+For each source, in order, add (using the dest's recorded `chapter_input_idiom`).
+CRITICAL (gcs-ykx): scope each source's `\input` so a stray in-body `\appendix` (or
+`\backmatter`/`\frontmatter`/`\begin{appendices}`) cannot bleed past this chapter and
+renumber the FOLLOWING chapters as appendices. A source body that ends in a bare
+`\appendix` is the known failure. Wrap every source input in a local group that
+neutralizes those switches:
 ```latex
 \chapter{<title_override or title>}
+\begingroup\let\appendix\relax\let\frontmatter\relax\let\backmatter\relax
 \input{contents/<slug>/main}
+\endgroup
 ```
 For a BLANK dest, place these between `\tableofcontents` and `\end{document}`, with the
 master `\bibliography{...}` (or biblatex resource) after the last chapter. For an
