@@ -1,0 +1,196 @@
+description = '''
+Build or extend a beads dependency graph for a region of {{paper_path}}. The
+region can be a section, subsection, chapter, or raw line range. Extracts all
+numbered theorem-like environments, creates stubs for cross-region \ref
+references and \cite bibliography citations, creates a bead per result, wires up
+dependencies, and renders a Graphviz PNG. Pass existing_epic to add to an
+existing graph instead of creating a new one.
+'''
+formula = "math-dep-graph"
+version = 2
+
+[requires]
+formula_compiler = ">=2.0.0"
+
+[vars]
+[vars.region]
+description = "The region to graph. Accepted formats: 'section:5', 'subsection:3.2', 'chapter:2', 'lines:808-984'. The prefix determines how 'locate-region-boundaries' finds the range."
+required = true
+
+[vars.paper_path]
+description = "Path to the main .tex file (e.g. papers/2510.22678/main.tex)"
+required = true
+
+[vars.existing_epic]
+description = "ID of an existing dependency-graph epic to extend (e.g. math-playground-9qy). If empty, a new epic is created. If set, new beads are added as children of that epic and existing stubs/results are reused rather than duplicated."
+required = false
+default = ""
+
+[[steps]]
+id = "setup-dep-graph-dir"
+title = "Create and initialize dep-graph/ working directory"
+description = '''
+Ensure the dep-graph/ subdirectory exists in the project root (the directory that contains the .beads/ folder). If it does not exist, create it with 'mkdir -p dep-graph'. Then check whether dep-graph/.beads/ already exists. If it does not, run 'cd dep-graph && bd init --prefix dep-graph --stealth' to initialize a fresh beads database there. If dep-graph/.beads/ already exists, skip init. Record the absolute path to dep-graph/ as notes on this bead — all subsequent bd commands in this workflow must be run from that directory.
+'''
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "resolve-epic"
+title = "Resolve or create the epic for {{region}}"
+needs = ["setup-dep-graph-dir"]
+description = '''
+IMPORTANT: Run all bd commands in this step (and all subsequent steps) from the dep-graph/ directory (e.g. prefix each with 'cd dep-graph &&' or set your shell working directory to dep-graph/ for the session).
+
+If {{existing_epic}} is empty: create a new epic with title 'Dependency graph: {{region}} of {{paper_path}}', type=epic, priority=2. Record its ID as the target epic for all subsequent steps.
+
+If {{existing_epic}} is set: run 'bd show {{existing_epic}}' and list all existing child beads. Produce an inventory with three lists — (1) existing [External] stub titles and their bead IDs, (2) existing [Cite] stub titles and their bead IDs, (3) existing in-region result titles and their bead IDs. Write the target epic ID and inventory as notes on this bead. Subsequent create-* steps will check this inventory to skip duplicates and reuse existing bead IDs for wiring.
+'''
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "check-theorem-counter"
+title = "Check theorem counter setup in {{paper_path}}"
+description = '''
+Read the preamble of {{paper_path}} and grep for \newtheorem declarations. Determine which environments share a counter (e.g. all share [figure]) and whether actual \begin{figure} blocks also increment it. Record which short-form aliases (thm/lem/prop/etc.) exist. Write findings as notes on this bead.
+'''
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "locate-region-boundaries"
+title = "Locate line range for {{region}} in {{paper_path}}"
+needs = ["check-theorem-counter"]
+description = '''
+Parse {{region}} to determine the region type and identifier, then find the line range:
+
+- 'section:N' — grep for \section to find the Nth section; range ends at the next \section or EOF.
+- 'subsection:N.M' — grep for \subsection to find subsection N.M; range ends at the next \subsection, \section, or EOF.
+- 'chapter:N' — grep for \chapter to find the Nth chapter; range ends at the next \chapter or EOF.
+- 'lines:START-END' — use START and END directly as the line range.
+
+For all structural types (section/subsection/chapter), also check the .aux file (if present) to confirm the first counter value assigned in the region and the number prefix used for results (e.g. '5.' or '3.2.'). For line ranges, scan the .aux file for any newlabel entries whose page/line falls within the range to determine the number prefix.
+
+Write the resolved line range and number prefix as notes on this bead.
+'''
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "extract-numbered-environments"
+title = "Extract all numbered environments in {{region}}"
+needs = ["locate-region-boundaries"]
+description = '''
+Read the line range found in 'locate-region-boundaries'. List every environment that increments the shared counter in order: \begin{figure}, \begin{thm/theorem}, \begin{lem/lemma}, \begin{prop/proposition}, \begin{cor/corollary}, \begin{defn/definition}, \begin{rmk/remark}, \begin{exam/example}, \begin{claim}, \begin{notn/notation}, etc. For each, record: number (derived from the number prefix found in 'locate-region-boundaries' plus sequential position, cross-checked against the .aux file), type, \label if present, all \ref targets in its statement and proof body, and all \cite keys in its statement and proof body. Write the complete list as notes on this bead.
+'''
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "classify-ref-targets"
+title = "Classify \\ref cross-references as internal or external in {{region}}"
+needs = ["extract-numbered-environments"]
+description = '''
+For each \ref target collected in 'extract-numbered-environments': look up the label in the .aux file. If the label belongs to a result whose line falls inside the region (line range from 'locate-region-boundaries'), mark it internal. If it belongs outside the region or is undefined, mark it external. Produce a table with columns [number, type, label, internal_deps, external_deps] and write it as notes on this bead.
+'''
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "lookup-cite-keys"
+title = "Look up \\cite bibliography keys for {{region}}"
+needs = ["extract-numbered-environments"]
+description = '''
+For each distinct \cite key collected in 'extract-numbered-environments': look it up in the .bib file (same directory as {{paper_path}}) and record the short citation key plus a brief description of what is being cited (author, year, theorem/proposition number if the citation specifies one). Produce a table with columns [cite_key, description, cited_by (list of result numbers)] and write it as notes on this bead.
+'''
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "create-ref-stubs"
+title = "Create [External] stub beads for out-of-region \\ref references"
+needs = ["classify-ref-targets", "resolve-epic"]
+description = '''
+For each distinct external \ref label in 'classify-ref-targets': check the inventory from 'resolve-epic' for an existing stub with the same label. If one exists, record its bead ID for use in 'wire-dependencies' and skip creation. If none exists, create one bead titled '[External] <Type> <Number> (<label>): <brief description>', type=task, priority=2, parented to the target epic. Look up number and type in the .aux file. Write a mapping of [label → bead ID] (both reused and newly created) as notes on this bead.
+'''
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "create-cite-stubs"
+title = "Create [Cite] stub beads for bibliography citations"
+needs = ["lookup-cite-keys", "resolve-epic"]
+description = '''
+For each distinct \cite key in 'lookup-cite-keys': check the inventory from 'resolve-epic' for an existing stub with the same key. If one exists, record its bead ID for use in 'wire-dependencies' and skip creation. If none exists, create one bead titled '[Cite] <key>: <brief description of cited result>', type=task, priority=2, parented to the target epic. Write a mapping of [cite_key → bead ID] (both reused and newly created) as notes on this bead.
+'''
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "create-in-region-beads"
+title = "Create a bead for each theorem/lemma/etc. in {{region}}"
+needs = ["classify-ref-targets", "lookup-cite-keys", "resolve-epic"]
+description = '''
+For each in-region result from 'classify-ref-targets' (skip figures): check the inventory from 'resolve-epic' for an existing bead with the same number and label. If one exists, record its bead ID and skip creation (it may gain new dependency edges in 'wire-dependencies'). If none exists, create one bead titled '<Type> <number> (<label or no label>): <short description>', type=task, priority=2, parented to the target epic. Use the correct shared-counter number from the .aux file. The description should state what the result says and list its internal deps, external deps, and bib citations from 'lookup-cite-keys'. Write a mapping of [result number → bead ID] as notes on this bead.
+'''
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "wire-dependencies"
+title = "Wire dependency edges between beads"
+needs = ["create-ref-stubs", "create-cite-stubs", "create-in-region-beads"]
+description = '''
+Using the bead ID mappings from 'create-ref-stubs', 'create-cite-stubs', and 'create-in-region-beads': for every internal dep, external dep, and bib citation identified in 'classify-ref-targets' and 'lookup-cite-keys', run 'bd dep add <child-id> <parent-id>'. This includes edges to reused stubs from an existing epic — bd dep add is idempotent so re-adding an existing edge is safe.
+'''
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "extract-definitions"
+title = "Extract defined terms from \\begin{mydef} blocks in {{region}}"
+needs = ["wire-dependencies"]
+description = '''
+Read the line range from 'locate-region-boundaries' in {{paper_path}}. For each \begin{mydef}[...] block in that range:
+
+1. Extract the primary defined term(s) from the bracket argument (e.g. '[Gradedwise completion]' → 'gradedwise completion'). Strip any \cite{...}, comma-separated sub-references, and LaTeX author attributions (text after a comma that looks like a citation) from the bracket — keep only the human-readable name portion. If the bracket defines multiple distinct concepts (e.g. 'A $G$-graded adic ring ... is called gradedwise complete if ...'), list each as a separate term.
+2. Also scan the body of the definition for \textit{...} or \emph{...} markup — these are secondary defined terms. Include them if they are not already covered by the bracket name.
+3. For each definition block, find the corresponding bead ID from the mapping produced in 'create-in-region-beads' (match by Def number and label).
+4. Produce a table with columns [def_bead_id, def_number, defined_terms (list)] and write it as notes on this bead. Omit definition blocks that have no identifiable multi-word or distinctive term (e.g. single common math words like 'ring' or 'ideal' alone).
+'''
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "find-definition-references"
+title = "Find occurrences of defined terms in other nodes"
+needs = ["extract-definitions"]
+description = '''
+For each (def_bead_id, defined_terms) pair from 'extract-definitions':
+
+1. For each defined term, search all OTHER bead titles and descriptions in the epic (from 'create-in-region-beads', 'create-ref-stubs', 'create-cite-stubs') for occurrences. Matching should be case-insensitive and should tolerate LaTeX math mode around the term (e.g. 'pro-$G$-graded Huber pair' matches 'pro-G-graded Huber pair'). Strip $ signs and simple LaTeX commands (\mathcal, \mathrm, etc.) before matching. Skip the definition bead itself.
+2. A bead 'references' a definition if any of the definition's terms appears in that bead's title or description.
+3. Produce a table with columns [def_bead_id, defined_term, referencing_bead_ids (list)] and write it as notes on this bead. If a definition's terms appear in zero other beads, note it as 'unreferenced' — these will produce no new edges.
+'''
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "compute-minimal-definition-deps"
+title = "Compute minimal definition dependency edges (remove transitive redundancy)"
+needs = ["find-definition-references"]
+description = '''
+Using the reference table from 'find-definition-references' and the full set of existing dependency edges (from 'wire-dependencies'):
+
+1. Build the transitive closure of all existing edges in the graph. For each pair (A, B), A transitively depends on B if there is any directed path from A to B following existing 'bd dep add' edges.
+2. For each (def_bead_id, referencing_bead_id) candidate edge from 'find-definition-references': suppress it if referencing_bead_id already transitively depends on def_bead_id through the existing graph (i.e. the edge is already implied). Keep it only if referencing_bead_id does NOT already have a path to def_bead_id.
+3. Among the kept edges, also apply direct minimality: if referencing_bead_id → def_bead_id would be kept, but referencing_bead_id already directly depends on some intermediate bead X that itself references def_bead_id (i.e. X is already in 'find-definition-references' for the same def), suppress the edge to def_bead_id from referencing_bead_id — it is implied through X.
+4. Produce a final table with columns [def_bead_id, referencing_bead_id, kept (yes/no), reason_if_suppressed] and write it as notes on this bead.
+'''
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "add-definition-deps"
+title = "Add definition dependency edges to beads"
+needs = ["compute-minimal-definition-deps"]
+description = '''
+For each kept edge in the final table from 'compute-minimal-definition-deps': run 'bd dep add <referencing_bead_id> <def_bead_id>' (the referencing bead depends on the definition bead). bd dep add is idempotent so it is safe to re-add any edge that already exists. Report the total count of edges added and any errors.
+'''
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "generate-visualization"
+title = "Generate Graphviz dependency visualization for {{region}}"
+needs = ["add-definition-deps"]
+description = '''
+Derive a safe filename slug from {{region}} (e.g. 'section-5', 'subsection-3-2', 'lines-808-984'). If {{existing_epic}} is set, prefix the slug with the epic ID (e.g. 'dep-graph-9qy-section-6') to avoid overwriting the previous PNG. Query all beads parented to the target epic (including any carried over from a previous region) via 'cd dep-graph && bd show <epic-id>'. Write <project-root>/dep-graph/<slug>-deps.dot covering the full epic contents with rankdir=LR and color-coded nodes: Definitions in #e8f5e9 (green), external \ref stubs in #ffe0b2 (orange), \cite bibliography stubs in #f3e5f5 (purple), the main theorem(s) in #e3f2fd (blue), everything else white. Node labels: type+number on line 1, 3-5 word description on line 2. Edges in steelblue. Render: dot -Tpng -Gsize="18,12" -Gdpi=150 <project-root>/dep-graph/<slug>-deps.dot -o <project-root>/dep-graph/<slug>-deps.png. Report the output path. (Here <project-root> is the root of the math-playground repo, i.e. the directory containing the .beads/ folder.)
+'''
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
