@@ -1,0 +1,132 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/jjgarzella/latex-utils-pack/pdf-to-latex.plan.schema.json",
+  "title": "pdf-to-latex plan.json",
+  "description": "Agent<->script contract for the pdf-to-latex formula. Seeded by check-prereqs; each helper step reads and extends it. Helpers are testable in isolation: feed a plan.json + fixtures, assert the extended plan.json / body.tex. Objects are open (additionalProperties: true) so a downstream step may extend without a schema bump.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "formula", "vars", "flags", "log"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1",
+      "description": "Schema contract version. Bump on a breaking shape change."
+    },
+    "formula": {
+      "type": "string",
+      "const": "pdf-to-latex"
+    },
+    "vars": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["paper_dir"],
+      "description": "The formula vars as resolved for this run, echoed so helpers are self-contained.",
+      "properties": {
+        "paper_dir": {
+          "type": "string",
+          "description": "Absolute path to the directory containing the input PDF and all output artifacts."
+        },
+        "converter": {
+          "type": "string",
+          "enum": ["nougat", "marker", "mathpix"],
+          "description": "PDF->LaTeX converter to invoke."
+        },
+        "tex_engine": {
+          "type": "string",
+          "enum": ["xelatex", "lualatex", "pdflatex"],
+          "description": "TeX engine for the compile gate."
+        },
+        "preamble_path": {
+          "type": "string",
+          "description": "Absolute path to a custom preamble.tex. Empty => bundled preamble.tex."
+        },
+        "extra_kinds": {
+          "type": "string",
+          "description": "JSON array string of extra theorem-like kinds (e.g. '[\"Sublemma\"]')."
+        },
+        "skip_kinds": {
+          "type": "string",
+          "description": "JSON array string of kinds to exclude from inventory."
+        },
+        "converter_venv": {
+          "type": "string",
+          "description": "Path to a Python venv to activate before running the converter. Empty = use PATH as-is."
+        }
+      }
+    },
+    "input_pdf": {
+      "type": "string",
+      "description": "Absolute path to the discovered input PDF. Set by check-prereqs once the PDF is identified."
+    },
+    "raw_output": {
+      "type": "string",
+      "description": "Absolute path to the converter's raw output file (_raw.md or _raw.tex). Set by run-converter."
+    },
+    "inventory_counts": {
+      "type": "object",
+      "description": "Per-kind entry counts extracted from numbering.json. Set by build-inventory.",
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "flags": {
+      "type": "array",
+      "description": "Tier-2 flag-and-defer records. A helper that meets an ambiguity it cannot resolve appends a flag here; the agent resolves each flag and fills `resolution`.",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["id", "tier", "stage", "kind", "message"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Stable flag id, e.g. F1, F2."
+          },
+          "tier": {
+            "type": "integer",
+            "enum": [1, 2, 3]
+          },
+          "severity": {
+            "type": "string",
+            "enum": ["info", "warn", "blocker"],
+            "description": "blocker => must be resolved before the compile gate can pass."
+          },
+          "stage": {
+            "type": "string",
+            "description": "Which step raised it: check-prereqs | build-inventory | run-converter | wrap-body | emit-preamble | compile-and-verify."
+          },
+          "kind": {
+            "type": "string",
+            "description": "Machine tag, e.g. multiple-pdfs | converter-missing | unwrapped-theorem | page-count-skew."
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable description of what was deferred and why."
+          },
+          "location": {
+            "type": ["string", "null"],
+            "description": "File or context the flag points at."
+          },
+          "resolution": {
+            "type": ["string", "null"],
+            "description": "Filled by the agent (Tier 3) when resolved. null = unresolved."
+          }
+        }
+      }
+    },
+    "log": {
+      "type": "array",
+      "description": "Append-only step log built up as the formula progresses.",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["step", "summary"],
+        "properties": {
+          "step": {"type": "string"},
+          "ts": {"type": ["string", "null"], "description": "UTC ISO-8601 timestamp."},
+          "summary": {"type": "string"}
+        }
+      }
+    }
+  }
+}

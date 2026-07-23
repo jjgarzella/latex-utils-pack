@@ -1,0 +1,419 @@
+description = '''
+Convert a math paper PDF (older / non-arXiv) into compilable LaTeX with
+numbering fidelity preserved. Uses Strategy A: every theorem-like environment,
+section, equation, figure, and table number is emitted as literal source text
+(e.g. `\textbf{Theorem 3.4.}`, `\section*{3. Title}`, `\tag{3.4}`), so the
+rebuilt PDF shows the same numbers as the original AND downstream tex-analyzing
+formulas can recover those numbers without compiling. Pluggable converter
+(default `nougat`; also `marker`, `mathpix`) is assumed preinstalled — fail fast
+with an install hint if not. Outputs a split layout (preamble.tex + body.tex +
+paper.tex) plus a machine-readable numbering.json index. NOT for arXiv papers —
+use `download-arxiv` for those.
+
+## How it works — helpers decide, the agent handles exceptions
+
+HELPER-DRIVEN: every mechanically-decidable transform is a small Python helper
+under `{{.CityRoot}}/packs/latex-utils/assets/scripts/pdf-to-latex/`. The formula
+orchestrates those helpers; it does NOT ask the agent to hand-edit `.tex`. The
+agent's job is judgment (choosing the input PDF when multiple exist, resolving
+Tier-2 flags) and DEBUGGING (fixing compile failures) — not mechanical editing.
+
+All steps share ONE session (`gc.session_affinity = require`) and communicate
+through a single `plan.json` on disk — the agent<->script CONTRACT. The
+check-prereqs step seeds it; every helper reads and extends it. Schema:
+
+  schema  : {{.CityRoot}}/packs/latex-utils/assets/pdf-to-latex.plan.schema.json
+  shared  : {{.CityRoot}}/packs/latex-utils/assets/scripts/planlib.py
+  on disk : ${PDF_TO_LATEX_PLAN:-${TMPDIR:-/tmp}/pdf-to-latex/${GC_BEAD_ID}/plan.json}
+
+IMPORTANT: the Bash tool shares cwd across calls (including parallel calls).
+NEVER use `cd` in any step; always use absolute paths.
+
+## Scope
+
+IN: PDFs with a text layer (pdftotext produces output); nougat, marker, or
+mathpix converters; xelatex/lualatex/pdflatex compile gates.
+OUT: scanned PDFs with no text layer; arXiv papers (use `download-arxiv`).
+Live end-to-end smoke (needs pandoc + pdftotext + the marker/nougat model) is
+not part of offline unit testing; see assets/scripts/pdf-to-latex/test_pdf_to_latex.py.
+'''
+formula = "pdf-to-latex"
+version = 2
+
+[requires]
+formula_compiler = ">=2.0.0"
+
+[vars]
+[vars.paper_dir]
+description = "Absolute path to a directory containing the input PDF. All output artifacts (paper.tex, preamble.tex, body.tex, numbering.json, conversion.log, build/) are written into this directory."
+required = true
+
+[vars.converter]
+description = "PDF->LaTeX converter: 'nougat' (default; Meta academic-PDF model, GPU recommended), 'marker' (free, weaker on math), 'mathpix' (paid API; needs MATHPIX_APP_ID + MATHPIX_APP_KEY)."
+required = false
+default = "nougat"
+
+[vars.tex_engine]
+description = "TeX engine for the compile gate: 'xelatex' (default — handles Unicode natively), 'lualatex', 'pdflatex'. Use pdflatex only if converter output is pure ASCII."
+required = false
+default = "xelatex"
+
+[vars.preamble_path]
+description = "Absolute path to a custom preamble.tex. If empty, the bundled preamble at {{.CityRoot}}/packs/latex-utils/assets/scripts/pdf-to-latex/preamble.tex is used (article class + amsmath/amssymb/amsthm/graphicx/geometry/hyperref)."
+required = false
+default = ""
+
+[vars.extra_kinds]
+description = "JSON array of additional theorem-like environment kinds beyond auto-discovery (e.g. [\"Sublemma\", \"Scholium\"]). Default: []."
+required = false
+default = "[]"
+
+[vars.skip_kinds]
+description = "JSON array of kinds to exclude from the inventory even if auto-discovered (e.g. [\"Page\"]). Default: []."
+required = false
+default = "[]"
+
+[vars.converter_venv]
+description = "Absolute path to a Python venv to activate before running the converter (e.g. /opt/envs/marker). Empty = use PATH as-is. Set this if the converter requires an isolated Python environment."
+required = false
+default = ""
+
+[[steps]]
+id = "check-prereqs"
+title = "Verify prerequisites, discover input PDF, and seed plan.json"
+description = '''
+Verify all prerequisites and identify the input PDF BEFORE doing any work.
+Seed `plan.json` so every later step can read the resolved vars.
+
+**1. Set up the plan path (run first, before anything else).**
+```bash
+set -euo pipefail
+PACK="{{.CityRoot}}/packs/latex-utils"
+SCRIPTS="$PACK/assets/scripts/pdf-to-latex"
+PLAN="${PDF_TO_LATEX_PLAN:-${TMPDIR:-/tmp}/pdf-to-latex/${GC_BEAD_ID:-adhoc}/plan.json}"
+export PDF_TO_LATEX_PLAN="$PLAN"
+mkdir -p "$(dirname "$PLAN")"
+```
+
+**2. Seed plan.json.** (Skip if it already exists with schema_version=1 — resume-safe.)
+```bash
+python3 - <<'SEED'
+import json, os, sys
+path = os.environ["PDF_TO_LATEX_PLAN"]
+if os.path.exists(path):
+    d = json.load(open(path))
+    if d.get("schema_version") == "1":
+        print("plan.json already seeded; skipping"); sys.exit(0)
+plan = {
+    "schema_version": "1", "formula": "pdf-to-latex",
+    "vars": {
+        "paper_dir":      "{{paper_dir}}",
+        "converter":      "{{converter}}",
+        "tex_engine":     "{{tex_engine}}",
+        "preamble_path":  "{{preamble_path}}",
+        "extra_kinds":    "{{extra_kinds}}",
+        "skip_kinds":     "{{skip_kinds}}",
+        "converter_venv": "{{converter_venv}}",
+    },
+    "input_pdf": "", "raw_output": "", "inventory_counts": {},
+    "flags": [], "log": [],
+}
+with open(path, "w") as fh: json.dump(plan, fh, indent=2); fh.write("\n")
+print(f"Seeded plan.json at {path}")
+SEED
+```
+
+**3. Activate converter venv (if set).** If `{{converter_venv}}` is non-empty,
+activate that venv for all subsequent subprocess calls by prepending its
+`bin/` to PATH:
+```bash
+if [ -n "{{converter_venv}}" ]; then
+  export PATH="{{converter_venv}}/bin:$PATH"
+fi
+```
+
+**4. Check the converter.**
+- `nougat`: `which nougat` — on miss: `pip install nougat-ocr` (~1.4 GB model
+  download on first run; GPU recommended).
+- `marker`: `which marker_single` — on miss: `pip install marker-pdf` (requires
+  Python <=3.11). If no venv is active and the system Python is newer, set
+  `converter_venv` to an appropriate venv path.
+- `mathpix`: verify `MATHPIX_APP_ID` and `MATHPIX_APP_KEY` env vars are set
+  and non-empty.
+If the converter check fails, STOP — do not proceed.
+
+**5. Check the TeX engine and helper tools.**
+- `which {{tex_engine}}` — on miss: install TeX Live (e.g. `brew install --cask mactex`).
+- `which pdftotext pandoc` — `pdftotext` miss: `brew install poppler`;
+  `pandoc` miss: `brew install pandoc`.
+If any check fails, STOP.
+
+**6. Discover the input PDF.** List `*.pdf` files directly inside `{{paper_dir}}`
+(do NOT recurse; EXCLUDE anything inside `{{paper_dir}}/build/`):
+- Exactly ONE candidate: use it.
+- MULTIPLE candidates: present the list via AskUserQuestion and use the chosen one.
+- ZERO candidates: STOP and report.
+
+**7. Record `input_pdf` in plan.json and add a log entry.**
+```bash
+python3 - <<'RECORD'
+import json, os, sys
+path = os.environ["PDF_TO_LATEX_PLAN"]
+plan = json.load(open(path))
+plan["input_pdf"] = "<ABSOLUTE_PATH_TO_CHOSEN_PDF>"  # fill in the real path
+import sys; sys.path.insert(0, os.path.dirname(path.replace("/plan.json","")) or ".")
+scripts = os.path.join("{{.CityRoot}}", "packs", "latex-utils", "assets", "scripts")
+sys.path.insert(0, scripts)
+import planlib
+planlib.add_log(plan, "check-prereqs", "Prerequisites verified; input_pdf set")
+planlib.save(path, plan)
+RECORD
+```
+(Or load/add_log/save via planlib directly — the above is illustrative.)
+
+Close this step once plan.json has a non-empty `input_pdf` and all prerequisites
+are confirmed. If ANY prerequisite check fails, STOP — do not proceed.
+'''
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "build-inventory"
+title = "Extract numbering inventory from the PDF -> numbering.json"
+needs = ["check-prereqs"]
+description = '''
+Run the build_inventory helper to extract every numbered item from the PDF's
+text layer into `{{paper_dir}}/numbering.json` and extend plan.json with
+`inventory_counts`.
+
+```bash
+set -euo pipefail
+PACK="{{.CityRoot}}/packs/latex-utils"
+SCRIPTS="$PACK/assets/scripts/pdf-to-latex"
+PLAN="${PDF_TO_LATEX_PLAN:?PDF_TO_LATEX_PLAN not set — re-export from check-prereqs}"
+gc bd heartbeat "$GC_BEAD_ID"
+
+python3 "$SCRIPTS/build_inventory.py" --plan "$PLAN"
+```
+
+The helper reads `paper_dir`, `input_pdf`, `extra_kinds`, and `skip_kinds` from
+plan.json; runs `pdftotext -layout`; auto-discovers theorem-like kinds; extracts
+theorems, lemmas, propositions, corollaries, definitions, remarks, examples,
+conjectures, chapters, sections, subsections, display equations, figures, and
+tables; deduplicates; writes `{{paper_dir}}/numbering.json`; then extends
+plan.json with `inventory_counts` (per-kind counts) and a log entry.
+
+Review the printed counts. If coverage looks thin for a particular section, use
+`pdftoppm` + a vision verifier on that page to confirm the text layer is adequate.
+
+Tier-2 ambiguities (kind discovered that overlaps with noise words, or very low
+count suggesting the text layer is partial): add a flag via planlib and note in
+the close.
+'''
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "run-converter"
+title = "Run {{converter}} on the input PDF -> _raw.md"
+needs = ["check-prereqs"]
+description = '''
+Run the converter to produce `{{paper_dir}}/_raw.md` (for nougat/marker) or
+`{{paper_dir}}/_raw.tex` (for mathpix). Use the `input_pdf` path from plan.json.
+Stream all stdout/stderr to `{{paper_dir}}/conversion.log`.
+
+```bash
+set -euo pipefail
+PACK="{{.CityRoot}}/packs/latex-utils"
+PLAN="${PDF_TO_LATEX_PLAN:?PDF_TO_LATEX_PLAN not set}"
+SCRIPTS="$PACK/assets/scripts/pdf-to-latex"
+# Activate venv if set
+[ -n "{{converter_venv}}" ] && export PATH="{{converter_venv}}/bin:$PATH"
+gc bd heartbeat "$GC_BEAD_ID"
+
+# Read input_pdf from plan.json
+INPUT_PDF=$(python3 -c "import json; print(json.load(open('$PLAN'))['input_pdf'])")
+PAPER_DIR="{{paper_dir}}"
+```
+
+**Branch on `{{converter}}`** (use absolute paths; NEVER cd into `{{paper_dir}}`):
+
+- `nougat`:
+  ```bash
+  nougat "$INPUT_PDF" -o "$PAPER_DIR/" 2>&1 | tee -a "$PAPER_DIR/conversion.log"
+  # locate .mmd file produced and rename to _raw.md
+  MMD=$(ls "$PAPER_DIR/"*.mmd 2>/dev/null | head -1)
+  [ -n "$MMD" ] && mv -f "$MMD" "$PAPER_DIR/_raw.md"
+  ```
+
+- `marker`:
+  ```bash
+  marker_single "$INPUT_PDF" "$PAPER_DIR/_marker_out" 2>&1 | tee -a "$PAPER_DIR/conversion.log"
+  # locate .md produced inside _marker_out
+  MD=$(find "$PAPER_DIR/_marker_out" -name "*.md" | head -1)
+  [ -n "$MD" ] && cp -f "$MD" "$PAPER_DIR/_raw.md"
+  ```
+
+- `mathpix` (PDF endpoint, tex.zip):
+  ```bash
+  curl -s -X POST "https://api.mathpix.com/v3/pdf" \
+    -H "app_id: $MATHPIX_APP_ID" -H "app_key: $MATHPIX_APP_KEY" \
+    -F "file=@$INPUT_PDF" -F 'options_json={"conversion_formats":{"tex.zip":true}}' \
+    > "$PAPER_DIR/_mathpix_response.json"
+  PDF_ID=$(python3 -c "import json; print(json.load(open('$PAPER_DIR/_mathpix_response.json'))['pdf_id'])")
+  # Poll for completion and download tex.zip, unzip, find main .tex, copy to _raw.tex
+  # (Use the conversion_id from the response and poll the status endpoint.)
+  ```
+
+If the converter fails (non-zero exit, empty output), STOP and report — do not
+produce a partial body.
+
+**Record raw_output in plan.json.**
+```bash
+python3 - <<'RECORD'
+import json, os, sys
+path = os.environ["PDF_TO_LATEX_PLAN"]
+plan = json.load(open(path))
+# Set the path to the raw output file
+plan["raw_output"] = "{{paper_dir}}/_raw.md"  # or _raw.tex for mathpix
+scripts = os.path.join("{{.CityRoot}}", "packs", "latex-utils", "assets", "scripts")
+sys.path.insert(0, scripts)
+import planlib
+planlib.add_log(plan, "run-converter", "Converter {{converter}} produced raw output")
+planlib.save(path, plan)
+RECORD
+```
+'''
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "wrap-body"
+title = "Transform raw converter output into body.tex with Strategy A number fidelity"
+needs = ["build-inventory", "run-converter"]
+description = '''
+Run the wrap_body helper to produce `{{paper_dir}}/body.tex` with all numbered
+items wrapped per Strategy A (literal number text in the source).
+
+```bash
+set -euo pipefail
+PACK="{{.CityRoot}}/packs/latex-utils"
+SCRIPTS="$PACK/assets/scripts/pdf-to-latex"
+PLAN="${PDF_TO_LATEX_PLAN:?PDF_TO_LATEX_PLAN not set}"
+gc bd heartbeat "$GC_BEAD_ID"
+
+python3 "$SCRIPTS/wrap_body.py" --plan "$PLAN"
+```
+
+The helper reads `paper_dir` and `raw_output` from plan.json; runs pandoc for
+bulk markdown->LaTeX conversion; then applies Strategy A overlays using
+numbering.json:
+- Theorem-likes → `\textbf{Kind N.M.}` (bold heading with literal number).
+- Sections/subsections → literal number prefixed to the heading text.
+- Equations → `\tag{N.M}` wrappers (or `(N.M)` literal).
+- Figures/Tables → `[Figure N.M omitted: <caption>]` placeholder boxes.
+- Bare `\begin{split}` → wrapped in `\[...\]`.
+- `#` outside math → escaped to `\#`.
+
+Writes `{{paper_dir}}/body.tex` and extends plan.json with a log entry.
+The helper prints any theorem-likes it could not wrap — treat those as soft
+Tier-2 failures: add a planlib flag for each and note the count.
+'''
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "emit-preamble"
+title = "Write preamble.tex and top-level paper.tex"
+needs = ["wrap-body"]
+description = '''
+Assemble the final LaTeX document structure in `{{paper_dir}}`.
+
+```bash
+set -euo pipefail
+PACK="{{.CityRoot}}/packs/latex-utils"
+SCRIPTS="$PACK/assets/scripts/pdf-to-latex"
+PLAN="${PDF_TO_LATEX_PLAN:?PDF_TO_LATEX_PLAN not set}"
+```
+
+**1. Write preamble.tex.**
+```bash
+if [ -n "{{preamble_path}}" ]; then
+  cp -f "{{preamble_path}}" "{{paper_dir}}/preamble.tex"
+else
+  cp -f "$SCRIPTS/preamble.tex" "{{paper_dir}}/preamble.tex"
+fi
+```
+
+**2. Write paper.tex.**
+```bash
+cat > "{{paper_dir}}/paper.tex" <<'PAPER'
+\input{preamble}
+\begin{document}
+\input{body}
+\end{document}
+PAPER
+```
+
+**3. Extend plan.json.**
+```bash
+python3 - <<'RECORD'
+import sys, os
+sys.path.insert(0, os.path.join("{{.CityRoot}}", "packs", "latex-utils", "assets", "scripts"))
+import planlib
+plan = planlib.load(os.environ["PDF_TO_LATEX_PLAN"])
+planlib.add_log(plan, "emit-preamble", "preamble.tex and paper.tex written to {{paper_dir}}")
+planlib.save(os.environ["PDF_TO_LATEX_PLAN"], plan)
+RECORD
+```
+
+Close this step once `{{paper_dir}}/preamble.tex` and `{{paper_dir}}/paper.tex`
+both exist.
+'''
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "compile-and-verify"
+title = "Compile paper.tex and verify numbering fidelity — HARD GATE"
+needs = ["emit-preamble"]
+description = '''
+Run the verify helper with `--final` to compile paper.tex and check that every
+inventory entry appears in the rebuilt PDF and is wrapped in body.tex.
+
+```bash
+set -euo pipefail
+PACK="{{.CityRoot}}/packs/latex-utils"
+SCRIPTS="$PACK/assets/scripts/pdf-to-latex"
+PLAN="${PDF_TO_LATEX_PLAN:?PDF_TO_LATEX_PLAN not set}"
+gc bd heartbeat "$GC_BEAD_ID"
+
+python3 "$SCRIPTS/verify.py" --plan "$PLAN" --final
+```
+
+`verify.py --final` (plan-driven mode):
+1. Reads `paper_dir`, `input_pdf`, and `tex_engine` from plan.json.
+2. Runs `{{tex_engine}}` twice on `{{paper_dir}}/paper.tex` with
+   `TEXINPUTS=".:{{paper_dir}}:"` and `-output-directory={{paper_dir}}/build/`.
+   **HARD FAIL (exit 1)** if no PDF is produced — retry this step.
+3. Runs pdftotext on the rebuilt PDF and checks every inventory entry.
+4. **Soft fail (exit 2)** if any entry is missing from the PDF or unwrapped in
+   body.tex — review the printed list and fix body.tex, then retry.
+5. Soft warning if rebuilt page count is outside +/- 20% of original.
+6. Extends plan.json with a PASS / SOFT_FAIL log entry.
+
+**If the compile fails (exit 1):** read `{{paper_dir}}/conversion.log` for the
+fatal error line. Common fixes: missing package (`\usepackage{...}` in preamble),
+undefined control sequence (an unwrapped macro from the converter), encoding issue
+(switch engine or add `\usepackage[T1]{fontenc}`). Fix and retry.
+
+**If soft failures reported (exit 2):** the listed items are in numbering.json
+but missing from the rebuilt PDF or not wrapped in body.tex. Review body.tex at
+the affected locations and apply the required `\textbf{}` or `\tag{}` wrappers
+manually, then re-run `verify.py --plan "$PLAN" --final` to confirm.
+
+Do NOT silence warnings to pass the gate — fix the underlying cause.
+
+Close this step only on a clean exit 0 (or documented, reviewed soft failures
+whose root cause is converter noise, not structural content loss).
+'''
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[steps.retry]
+max_attempts = 2
+on_exhausted = "hard_fail"
