@@ -1,0 +1,592 @@
+description = '''
+Add one or more BibTeX references to ANY LaTeX project, gating EACH entry on
+individual human approval. The formula discovers every outstanding reference
+(all undefined `\cite` keys, or an explicit list), drafts an official BibTeX
+entry for each, then — behind a STRUCTURAL human gate — presents them to the
+reviewer one at a time and writes only the ones the reviewer approves. Nothing
+is written to a `.bib` until a human says yes.
+
+General-purpose: the source papers, the `.bib` layout (one shared file or a
+published/preprints split), the master `\documentclass` document, the build
+command, and who reviews are all parameters. Every variable is optional; an
+empty variable means "auto-detect". This formula installs nothing; it assumes a
+complete local LaTeX toolchain and network access for BibTeX lookups.
+
+## How it works — helpers decide, the agent handles exceptions
+
+The formula is HELPER-DRIVEN, exactly like its sibling `mol-latex-concat`. The
+mechanically-decidable work is done by small, individually-runnable Python
+helpers under `{{.CityRoot}}/packs/latex-utils/assets/scripts/`:
+
+  find_undefined_cites.py  enumerate every undefined `\cite` key -> plan.worklist
+  insert_bib_entry.py      insert ONE approved entry into the routed .bib (idempotent)
+  verify.py                compile gate (baseline + final)
+  inspect_sources.py       parse a project (entry file, bib backend, .bib files)
+  merge_bib.py             BibTeX parser reused by the two helpers above
+
+The formula ORCHESTRATES those helpers; it never asks the agent to hand-edit a
+`.bib`. The agent's job is JUDGMENT (identify each paper, classify it, choose a
+citekey, draft the entry, decide deferrals) and it is an EXCEPTION HANDLER for
+everything a helper flagged. Every step shares ONE session
+(`gc.session_affinity = require`, `gc.continuation_group = "main"`) and
+communicates through a single `plan.json` on disk — the agent<->script CONTRACT.
+load-context seeds it; find_undefined_cites.py fills the worklist; the discover
+step writes each drafted entry into `plan.worklist[]`; confirm-and-write flips
+each entry to `written` as `insert_bib_entry.py` inserts it.
+
+  schema  : {{.CityRoot}}/packs/latex-utils/assets/plan.schema.json
+  shared  : {{.CityRoot}}/packs/latex-utils/assets/scripts/planlib.py  (load/save/add_flag/add_log)
+  on disk : ${ADD_BIB_PLAN:-${TMPDIR:-/tmp}/add-bib-references/${GC_BEAD_ID}/plan.json}
+            (bead-keyed so a restart re-finds it; a gitignored scratch path — the
+             drafted-but-unapproved BibTeX lives here and is NEVER committed)
+
+## Three-tier flag protocol (bibliographic data is not mechanically decidable)
+
+- Tier 1 — GENUINELY MECHANICAL: enumerating undefined `\cite` keys, parsing the
+  `.bib` union, inserting an approved entry into the right file/section, the
+  compile gate. Helpers just do these.
+- Tier 2 — mechanical over the well-behaved subset; FLAG-AND-DEFER, NEVER GUESS:
+  an unresolvable `\input`, a `.bib` that will not parse, a key the compile log
+  reports undefined but the source scan missed, an ambiguous published-vs-preprint
+  `.bib` role. A helper that meets one appends a record to `plan.json.flags[]`
+  and moves on — it does not guess.
+- Tier 3 — IRREDUCIBLY AGENTIC: identifying the actual paper behind a cryptic
+  source description, classifying published vs preprint, fetching the OFFICIAL
+  BibTeX (never arXiv for a published paper), choosing a citekey, and resolving
+  every Tier-2 flag. The reviewer is the final gate: no entry is written without
+  an explicit per-entry human yes.
+
+## Variables (ALL optional — an empty value means auto-detect)
+
+| Variable        | Default | Empty-value behavior |
+|-----------------|---------|----------------------|
+| references      | ""      | Comma-separated citekeys to add. Empty => ALL undefined `\cite` keys in the master's `\input` tree. Set => exactly those keys (a listed ref is included even if not yet `\cite`d). |
+| published_bib   | ""      | Path to the `.bib` for journal/proceedings/thesis entries. Empty => auto-detect the project `.bib`(s). |
+| preprints_bib   | ""      | Path to the `.bib` for genuine (arXiv-only) preprints. Empty => auto-detect; if only ONE `.bib` exists, published and preprints share it and entries are separated by `% ===== Published =====` / `% ===== Preprints =====` comment headers. |
+| master_source   | ""      | The `\documentclass` master `.tex` whose `\input`/`\include` tree is scanned for `\cite` keys. Empty => auto-detect it. |
+| tracking_file   | ""      | A checklist/issue file to reconcile against and tick off. Empty => skip all tracking bookkeeping. |
+| build_command   | ""      | Compile command for the baseline/final gate. Empty => auto-detect (prefer reusing `verify.py`; else `latexmk`; else `pdflatex -> bibtex -> pdflatex -> pdflatex`). |
+| discover_target | ""      | Routing for the discover step. Empty => run in the invoking session; set => route discovery to that agent/pool (e.g. a polecat). |
+| confirm_target  | ""      | Routing for the human-gated readiness/confirm steps. Empty => run in the invoking session; set => route to a human-capable session (e.g. mayor/crew). |
+| reviewer        | ""      | Who the entries are presented to for approval. Empty => the confirming session / overseer. |
+
+## Design decisions (locked with the overseer — do not deviate without escalating)
+
+- Generic. Arbitrary LaTeX projects; NO project-specific paths/names anywhere.
+  The PhD dissertation is a test case, not the target.
+- One formula, no runtime fan-out; references handled SEQUENTIALLY in one session.
+- Helpers, not prose. Mechanical writes go through `insert_bib_entry.py`; the
+  agent never hand-edits a `.bib`. plan.json is the contract, validated against
+  `assets/plan.schema.json`.
+- Baseline first. Compile once up front and record pre-existing errors/undefined
+  cites into `plan.baseline`, so a later failure is attributable to OUR edits and
+  a still-undefined DEFERRED key is not mistaken for a regression.
+- THREE-LAYER polecat safeguard so a whole-formula sling to an ephemeral worker
+  can NOT self-approve the human gate:
+  - L1 STRUCTURAL: `confirm-and-write` blocks on `readiness-gate`, whose
+    `[steps.gate]` synthesizes a real gate bead. The reviewer's yes CLOSES that
+    gate bead; a polecat cannot manufacture a human yes.
+  - L2 BEHAVIORAL: `confirm-and-write` opens with a hard identity guard — an
+    ephemeral/unattended worker reassigns the step to the reviewer and STOPS
+    instead of self-approving.
+  - L3 ROUTING: the gate/confirm steps prefer a human-capable target
+    (`confirm_target`) so approval does not land on a polecat in the first place.
+- Official BibTeX only. Publisher/DOI BibTeX for published work; the arXiv
+  `@misc` template only for genuine preprints. NEVER arXiv BibTeX for a published
+  paper. Cryptic/ambiguous references are FLAGGED and ESCALATED, never guessed.
+- `pour = true`: every step is a durable bead so a mid-confirm restart resumes
+  where it left off. The drafted-but-unapproved BibTeX lives in the scratch
+  plan.json and is excluded from the commit.
+- finalize commits ONLY the touched `.bib`(s) + tracking file, iff verify passed
+  AND the project is a git repo; it never pushes.
+'''
+formula = "add-bib-references"
+version = 2
+pour = true
+
+[requires]
+formula_compiler = ">=2.0.0"
+
+[catalog]
+name = "add-bib-references"
+description = "Add BibTeX references to a LaTeX project, one human-approved entry at a time."
+
+[vars]
+[vars.references]
+description = "Comma-separated citekeys to add. Empty => ALL undefined \\cite keys in the master's \\input tree; set => exactly those keys (included even if not yet \\cite'd)."
+required = false
+default = ""
+
+[vars.published_bib]
+description = "Path to the .bib holding published/proceedings/thesis entries. Empty => auto-detect the project .bib(s)."
+required = false
+default = ""
+
+[vars.preprints_bib]
+description = "Path to the .bib holding genuine (arXiv-only) preprints. Empty => auto-detect; a single .bib is shared with published, split by comment-section headers."
+required = false
+default = ""
+
+[vars.master_source]
+description = "The \\documentclass master .tex whose \\input/\\include tree is scanned for \\cite keys. Empty => auto-detect."
+required = false
+default = ""
+
+[vars.tracking_file]
+description = "A checklist/issue file to reconcile the worklist against and tick off. Empty => skip tracking bookkeeping."
+required = false
+default = ""
+
+[vars.build_command]
+description = "Compile command for the baseline/final gate. Empty => auto-detect (prefer verify.py; else latexmk; else pdflatex -> bibtex -> pdflatex -> pdflatex)."
+required = false
+default = ""
+
+[vars.discover_target]
+description = "Routing for the discover step. Empty => run in the invoking session; set => route discovery to that agent/pool."
+required = false
+default = ""
+
+[vars.confirm_target]
+description = "Routing for the human-gated readiness/confirm steps. Empty => run in the invoking session; set => route to a human-capable session (mayor/crew)."
+required = false
+default = ""
+
+[vars.reviewer]
+description = "Who the entries are presented to for approval. Empty => the confirming session / overseer."
+required = false
+default = ""
+
+[[steps]]
+id = "load-context"
+title = "Resolve config (vars else auto-detect), seed plan.json, build the worklist"
+description = '''
+Prime the run: resolve every configuration variable (or auto-detect it), seed the
+shared `plan.json`, and enumerate WHICH references need an entry. No `.bib` is
+touched here — this step only decides the target files and the worklist.
+
+**1. Identity + paths.**
+```bash
+set -uo pipefail
+: "${GC_AGENT:?GC_AGENT empty — harness did not inject identity; refuse}"
+PACK="{{.CityRoot}}/packs/latex-utils"; SCRIPTS="$PACK/assets/scripts"
+PLAN="${ADD_BIB_PLAN:-${TMPDIR:-/tmp}/add-bib-references/${GC_BEAD_ID:-adhoc}/plan.json}"
+export ADD_BIB_PLAN="$PLAN"; mkdir -p "$(dirname "$PLAN")"
+```
+
+**2. Resolve configuration (var if set, else auto-detect — Tier 3 judgment).**
+- `master_source` = `{{master_source}}` — if empty, find the `.tex` that carries
+  `\documentclass` (the manuscript root). `inspect_sources.py --plan <throwaway>
+  --sources <project_dir>` parses a project and reports its entry file, bib
+  backend, and `.bib` files; use it to CONFIRM your pick. Collect `\cite` keys
+  across its whole `\input`/`\include` tree, not just the root file.
+- `published_bib` / `preprints_bib` = `{{published_bib}}` / `{{preprints_bib}}` —
+  if empty, glob the project for `.bib` files. If exactly ONE exists, run in
+  SINGLE-BIB mode: published and preprints share it, separated by
+  `% ===== Published =====` / `% ===== Preprints =====` comment headers
+  (`insert_bib_entry.py` maintains those). If TWO exist, assign by name/content
+  (a "preprints"/"arxiv" file vs a "published"/"refs" file); if the roles are
+  genuinely ambiguous, `planlib.add_flag(... kind="bib-role-ambiguous" ...)` and
+  RESOLVE it before proceeding — do not guess which file is which.
+- `build_command` = `{{build_command}}` — if empty, prefer reusing `verify.py`
+  (baseline/final modes below); else `latexmk`; else the
+  `pdflatex -> bibtex -> pdflatex -> pdflatex` chain.
+- `tracking_file` = `{{tracking_file}}` — empty means no tracking bookkeeping.
+
+**3. Seed plan.json and build the worklist (Tier 1 helper).** `find_undefined_cites.py`
+seeds the plan on first run (via `planlib.new_bib_plan`) and enumerates the
+worklist idempotently by key:
+```bash
+python3 "$SCRIPTS/find_undefined_cites.py" --plan "$PLAN" \
+  --master-source "<resolved master_source>" \
+  --bib "<resolved published_bib>" [--bib "<resolved preprints_bib>"] \
+  --references "{{references}}"
+```
+With `--references` empty the worklist is every undefined `\cite` key in document
+order; set, it is exactly those keys. Then record the resolved config the helper
+did not set (single_bib, build_command, tracking_file) and echo the run vars into
+`plan.vars` with `jq`/`python3 -c 'import planlib; …'` so the plan is
+self-contained. This IS the "agent decides" half of the contract, not prose editing.
+
+**4. Read the flags.** `jq '.flags[]' "$PLAN"`. RESOLVE every blocker (an
+unresolved include whose cites would otherwise be missed, an ambiguous `.bib`
+role) and record the decision in its `resolution` field.
+
+Close this step once `plan.json` holds the resolved `config`, the echoed `vars`,
+and a `worklist` with no unresolved blocker flag. If the worklist is empty, there
+are no outstanding references — note it and let the run finish cleanly.
+'''
+needs = []
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "baseline-compile"
+title = "Baseline compile — record pre-existing errors/undefined so later failures are attributable"
+description = '''
+Capture the project's compile state BEFORE any entry is added. Undefined
+citations are EXPECTED here (that is why we are running); this step is
+informational, NOT a hard gate. Recording the baseline lets the final gate tell a
+regression from a reference we intentionally deferred.
+
+```bash
+set -uo pipefail
+PACK="{{.CityRoot}}/packs/latex-utils"; SCRIPTS="$PACK/assets/scripts"
+PLAN="${ADD_BIB_PLAN:-${TMPDIR:-/tmp}/add-bib-references/${GC_BEAD_ID:-adhoc}/plan.json}"
+PROJECT="$(dirname "$(jq -r '.config.master_source' "$PLAN")")"
+MASTER="$(basename "$(jq -r '.config.master_source' "$PLAN")")"
+
+python3 "$SCRIPTS/verify.py" --plan "$PLAN" --baseline --source "$PROJECT" --entry "$MASTER"; rc=$?
+# verify.py: 0 = clean · 1 = environment (missing engine) · 2 = gate-fail.
+# A gate-fail (2) from undefined \cite keys is EXPECTED at baseline; capture it.
+# An environment error (1) is a real toolchain gap — fail so retry/escalation acts.
+if [ "$rc" -eq 1 ]; then echo "[baseline] environment error (missing tool)"; exit 1; fi
+```
+
+`verify.py --baseline` compiles the master in place and leaves an engine `.log`
+beside it (`<master-jobname>.log`). Feed that log back so the pre-existing
+undefined-citation list is recorded and cross-checked against the source scan:
+```bash
+LOG="$PROJECT/${MASTER%.tex}.log"
+python3 "$SCRIPTS/find_undefined_cites.py" --plan "$PLAN" --log "$LOG"
+```
+This populates `plan.baseline.undefined` (from the compile log) and raises a
+`cite-scan-miss` flag for any key the compiler reports undefined that the source
+`\cite` scan did not find — verify those are really referenced. Then record any
+GENUINE pre-existing compile errors (unrelated to the missing cites we are about
+to add) into `plan.baseline.errors` with `jq`/`planlib`, so the final gate can
+subtract them.
+
+Close this step once `plan.baseline` reflects the pre-edit errors and undefined
+cites. If `build_command` was configured instead of `verify.py`, run it to
+produce the same `.log` and feed it identically.
+'''
+needs = ["load-context"]
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[steps.retry]
+max_attempts = 2
+on_exhausted = "hard_fail"
+
+[[steps]]
+id = "discover"
+title = "Identify, classify, fetch official BibTeX, and draft each entry (agent)"
+description = '''
+Tier-3 agentic core. For EACH pending worklist key, identify the real paper,
+classify it, fetch the OFFICIAL BibTeX, choose a citekey, and draft the entry
+with a clickable verification link. Nothing is written to a `.bib` here and
+nothing is presented for approval yet — you are only DRAFTING into the scratch
+plan.json. Discovery never blocks mid-run: a reference you cannot pin down is
+FLAGGED for escalation and you move to the next.
+
+```bash
+set -uo pipefail
+PACK="{{.CityRoot}}/packs/latex-utils"; SCRIPTS="$PACK/assets/scripts"
+PLAN="${ADD_BIB_PLAN:-${TMPDIR:-/tmp}/add-bib-references/${GC_BEAD_ID:-adhoc}/plan.json}"
+jq -r '.worklist[] | select(.status=="pending") | .key' "$PLAN"   # the keys to draft
+```
+
+For each key, in order:
+
+**1. Find the paper.** Start from the source description (author surnames + year).
+Search arXiv, publisher sites, DBLP, MathSciNet, Google Scholar. arXiv is for
+DISCOVERY, not the final BibTeX of a published paper. Watch for source typos /
+mis-attributions and FLAG rather than silently "correct" them: a misspelled
+surname, a wrong co-author, a year that is the arXiv-submission year not the
+publication year, reversed author order, the wrong venue. Parallelize search
+calls aggressively (10+ in one message is fine).
+
+**2. Classify published vs preprint.** Journal/proceedings version => `published`
+(publisher BibTeX). arXiv-only, no journal-ref => `preprint` (the `@misc` arXiv
+template — copy the shape of an existing preprint entry). Theses => `thesis`
+(`@phdthesis`, filed with published). Informal notes/letters => `@misc` with a
+`note = {Available at \url{...}}`.
+
+**3. Fetch OFFICIAL BibTeX**, preferred order: Springer
+(`https://citation-needed.springer.com/v2/references/<DOI>?format=bibtex&flavour=citation`),
+then AMS/Cambridge/Oxford/Elsevier "cite/export", then Numdam/HAL, then arXiv
+"Bibliographic Tools" (preprints ONLY). A journal with no online archive / no DOI
+for old volumes is not a lookup failure — write the entry with no `url`/`DOI` and
+accept MathSciNet/zbMATH verification.
+
+**4. Choose a citekey** per the project's existing convention (adapt to what the
+`.bib` already uses). A common style: 1 author `lastname+year` (`schoof1985`);
+2 authors last-name blend (`gaudryschost2004`); 3 authors initials (`chk2019`);
+4+ authors surname initials (`abcmt2019`); theses `lastnameYYYYthesis`
+(`costa2015thesis`); topic suffix to disambiguate (`harvey2015trace`). If unsure
+about 4+-author style, ESCALATE rather than pick.
+
+**5. Draft the entry into plan.worklist[]** (the gitignored scratch artifact). Set
+`bibtex` (full entry text), `classification`, `citekey`, `target_bib` (resolved
+path), `verify_url` (a CLICKABLE publisher/DOI URL — never a bare DOI string), and
+`status = "approved"` only after the entry is fully drafted (it still needs the
+human yes at confirm). Use `python3 -c 'import planlib; …'` to update the entry by
+`key`. Leave `status = "pending"` if you could not draft it.
+
+**Pitfalls — encode these, they were learned the hard way:**
+- A. Do NOT invent bibliographic data. Chapter-level DOIs in book series are not
+  predictable — use the book-level DOI. Never invent end pages, volume numbers, or
+  DOIs; drop the field or use only the book-level DOI when unsure.
+- B. Article-numbered journals: a lone small number in `pages` (e.g. `pages = {85}`)
+  is the article number, not a page range or year typo.
+- C. Never trust arXiv BibTeX for a published paper — it silently degrades the
+  bibliography. arXiv BibTeX only for genuinely unpublished work.
+- D. Never build a tracking-file update as `update --description "$(pipeline)"`: a
+  failing subshell can blank the whole field. Rewrite full content inline with a
+  heredoc (this bites at update-tracking, but draft the content carefully here).
+- E. Page ranges (`145--172`) come from a primary source; a single number may be
+  only a start page — confirm.
+- F. Deferred/clarification cases: mark the entry `deferred` with a note
+  ("awaiting clarification: …", "not public"), never a made-up answer.
+- G. A supplied URL/DOI may resolve to an unrelated paper — sanity-check it and
+  flag a mismatch rather than using it.
+- H. The same paper may appear in two sections; check the already-defined keys
+  before drafting a duplicate.
+- I. arXiv year vs journal year differ by 1–3 years; prefer the journal year for
+  published entries.
+- J. Some seminar/congress/institute series issue no DOIs — use a `url` to the
+  series/book page.
+- K. ESCALATION TRIGGERS — flag and defer, do not guess: author-name ambiguity;
+  an acronym/shorthand you cannot decode; source year disagreeing with the
+  findable year by more than 1 with no explanation; only one paper matching when
+  the source lists two; a non-standard/unverifiable DOI; 4+ authors with unclear
+  citekey style; a cryptic "so-and-so's work" personal reference.
+- L. Third-party aggregators cargo-cult wrong citations. If a paper's
+  volume/issue/pages are inconsistently sourced or absent from the publisher's own
+  site, treat the "consensus" as suspect: add a `[CITATION UNVERIFIED]` marker in
+  the `title` field plus a detailed `note` describing the exact discrepancy, and
+  flag it for the reviewer.
+
+For any escalation, `planlib.add_flag(plan, tier=2, stage="discover",
+kind="needs-clarification", severity="blocker", message="…")`, set the entry's
+`status = "escalated"` with a `note`, and CONTINUE to the next key.
+
+Close this step once every worklist key is either drafted (`approved`, with
+`bibtex`/`citekey`/`target_bib`/`verify_url`) or `deferred`/`escalated` with a
+note. End by telling the reviewer the readiness prompt is next (see readiness-gate).
+'''
+needs = ["baseline-compile"]
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require", "gc.run_target" = "{{discover_target}}" }
+
+[steps.retry]
+max_attempts = 2
+on_exhausted = "soft_fail"
+
+[[steps]]
+id = "readiness-gate"
+title = "Human readiness gate — reviewer confirms they are ready to review the entries"
+description = '''
+L1 STRUCTURAL safeguard. This step carries a `[steps.gate]` that synthesizes a
+real gate bead; `confirm-and-write` cannot start until a HUMAN closes that gate
+bead. A polecat cannot manufacture a human yes, so a whole-formula sling to an
+ephemeral worker stalls safely here instead of self-approving.
+
+Present the reviewer with the friendly readiness prompt — the count and a preview
+of the drafted keys (NEVER any "gate bead" jargon):
+
+> I found **N** reference(s) ready to review: `key1`, `key2`, `key3`, …
+> (plus M deferred/escalated that I could not pin down — details on request).
+> Please confirm you're ready to review them one at a time; I'll show each entry
+> with its BibTeX, a clickable verification link, the target `.bib`, and the
+> citekey, and I'll write only the ones you approve.
+
+Render the numbers from the scratch plan.json:
+```bash
+PLAN="${ADD_BIB_PLAN:-${TMPDIR:-/tmp}/add-bib-references/${GC_BEAD_ID:-adhoc}/plan.json}"
+jq -r '[.worklist[] | select(.status=="approved") | .citekey // .key] | "ready=\(length): \(join(", "))"' "$PLAN"
+jq -r '[.worklist[] | select(.status=="deferred" or .status=="escalated") | .key] | "deferred/escalated=\(length): \(join(", "))"' "$PLAN"
+```
+
+The reviewer's YES is CLOSING the synthesized gate bead. Only after it is closed
+does this step become ready; close it to release `confirm-and-write`. If the
+review must happen in a different (human-capable) session, `confirm_target`
+routes it there.
+'''
+needs = ["discover"]
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require", "gc.run_target" = "{{confirm_target}}" }
+
+[steps.gate]
+type = "human"
+id = "readiness"
+
+[[steps]]
+id = "confirm-and-write"
+title = "Per-entry human approval, then write each approved entry (agent)"
+description = '''
+Present each drafted entry to the reviewer SEQUENTIALLY and write only the ones
+approved. The L1 gate has already cleared; this step adds the L2 behavioral guard.
+
+**L2 BEHAVIORAL identity refusal — run this FIRST, before presenting anything.**
+An ephemeral/unattended pool worker must NOT self-approve. If this session is one,
+reassign the step to the reviewer and STOP:
+```bash
+set -uo pipefail
+PLAN="${ADD_BIB_PLAN:-${TMPDIR:-/tmp}/add-bib-references/${GC_BEAD_ID:-adhoc}/plan.json}"
+case "${GC_AGENT:-}" in
+  *polecat*|*worker*|*pool*)
+    REVIEWER="{{reviewer}}"; [ -z "$REVIEWER" ] && REVIEWER="{{confirm_target}}"
+    [ -z "$REVIEWER" ] && REVIEWER="${GC_RIG:+$GC_RIG/}crew"   # rig crew; fall back to ${GC_RIG:+$GC_RIG/}mayor if no crew worker
+    gc bd update "$GC_BEAD_ID" --assignee="$REVIEWER" --set-metadata gc.outcome=escalate \
+      --notes "confirm-and-write reached an ephemeral worker ($GC_AGENT); reassigned to a human-capable reviewer. Drafted entries await per-entry approval in $PLAN. No .bib written."
+    gc runtime drain-ack
+    exit 0
+    ;;
+esac
+```
+A human/attended session continues.
+
+**Per-entry sequential approval.** For EACH worklist entry with `status =
+"approved"`, in worklist order, present exactly the reviewer template and require
+an EXPLICIT yes for THAT entry:
+
+> Paper: **<authors> <year>** — <title>
+> Target: `<target_bib>`, citekey `<citekey>`, classification `<published|preprint|thesis>`
+> Source: [<publisher name> <ref>](<verify_url>)
+> ```bibtex
+> <bibtex>
+> ```
+
+On an explicit approval, write it IMMEDIATELY (idempotent — a re-run after a
+mid-confirm restart is a no-op for entries already inserted):
+```bash
+PACK="{{.CityRoot}}/packs/latex-utils"; SCRIPTS="$PACK/assets/scripts"
+python3 "$SCRIPTS/insert_bib_entry.py" --plan "$PLAN" --key "<key>" \
+  --classification "<published|preprint|thesis>" --bibtex "<bibtex>"
+```
+`insert_bib_entry.py` routes to the right file (two-bib) or section (single-bib),
+never double-inserts, and flips the worklist entry to `written` with its
+citekey/target_bib/bibtex recorded.
+
+Deferred / rejected / escalated => do NOT write. Set the entry's `status`
+(`deferred`/`escalated`) and a `note` explaining why (this context is recorded in
+`tracking_file` at the next step if one is configured). Move to the next entry.
+
+`pour = true` means a restart mid-confirm resumes: entries already `written` are
+skipped (idempotent insert), and only the still-`approved` remainder is presented.
+
+Close this step once every `approved` entry is either `written` or explicitly
+recorded `deferred`/`escalated`.
+'''
+needs = ["readiness-gate"]
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require", "gc.run_target" = "{{confirm_target}}" }
+
+[[steps]]
+id = "update-tracking"
+title = "Reconcile the tracking checklist (only if tracking_file is set)"
+description = '''
+Keep the project's checklist in sync with what was written. This step is a no-op
+when no `tracking_file` is configured.
+
+```bash
+set -uo pipefail
+PLAN="${ADD_BIB_PLAN:-${TMPDIR:-/tmp}/add-bib-references/${GC_BEAD_ID:-adhoc}/plan.json}"
+TRACK="$(jq -r '.config.tracking_file // empty' "$PLAN")"
+if [ -z "$TRACK" ]; then echo "[update-tracking] no tracking_file — skipping"; exit 0; fi
+```
+
+With a tracking file present, rewrite it so that:
+- each `written` entry's row is ticked with its citekey and verification URL filled in;
+- each new citekey is added to the "already in bib (skip)" list;
+- each `deferred`/`escalated` entry keeps its row OPEN with a context note
+  ("awaiting clarification: …", "not public", "handled manually") — deferred rows
+  carry context, never an empty box;
+- duplicates spotted during discovery are marked with the existing citekey.
+
+CRITICAL (pitfall D): never build the new content as
+`update --description "$(pipeline)"` — a failing subshell can blank the whole
+field. Rewrite the FULL file/description inline with a heredoc.
+
+Close this step once the tracking file reflects every worklist outcome.
+'''
+needs = ["confirm-and-write"]
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "verify"
+title = "Final compile gate — no NEW errors, every written key resolves"
+description = '''
+Confirm the edits did not break the build and that every entry we wrote actually
+resolves — diffing against the baseline so an intentionally DEFERRED key that was
+already undefined is not counted as a regression.
+
+```bash
+set -uo pipefail
+PACK="{{.CityRoot}}/packs/latex-utils"; SCRIPTS="$PACK/assets/scripts"
+PLAN="${ADD_BIB_PLAN:-${TMPDIR:-/tmp}/add-bib-references/${GC_BEAD_ID:-adhoc}/plan.json}"
+PROJECT="$(dirname "$(jq -r '.config.master_source' "$PLAN")")"
+MASTER="$(basename "$(jq -r '.config.master_source' "$PLAN")")"
+
+python3 "$SCRIPTS/verify.py" --plan "$PLAN" --final --dest "$PROJECT" --entry "$MASTER"; rc=$?
+LOG="$PROJECT/${MASTER%.tex}.log"
+```
+
+PASS criteria (you assert these — verify.py hard-fails on ANY undefined cite, but
+some are intentionally deferred):
+- NO new compile error vs `plan.baseline.errors`; and
+- every worklist entry with `status = "written"` now RESOLVES (its key is no
+  longer reported undefined in the log); and
+- the only citations still undefined are ones present in `plan.baseline.undefined`
+  AND recorded `deferred`/`escalated` in the worklist.
+
+If a key you WROTE does not resolve, your entry is malformed: fix it (re-draft and
+re-run `insert_bib_entry.py`) and recompile — this is the retry budget's purpose.
+If a NEW, unrelated error appears that you cannot resolve, ESCALATE (mail the
+mayor) rather than silence it. Do not doctor warnings to pass the gate.
+
+Close this step once the final compile introduces no regression and every written
+key resolves.
+'''
+needs = ["update-tracking"]
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[steps.retry]
+max_attempts = 3
+on_exhausted = "hard_fail"
+
+[[steps]]
+id = "finalize"
+title = "Commit the touched .bib(s) + tracking file (no push); close the step"
+description = '''
+Persist the approved work. Commit ONLY the files this run touched, and only if the
+verify gate passed and the project is a git repo. NEVER push — the human owns the
+push, exactly as with the sibling formula.
+
+```bash
+set -uo pipefail
+PLAN="${ADD_BIB_PLAN:-${TMPDIR:-/tmp}/add-bib-references/${GC_BEAD_ID:-adhoc}/plan.json}"
+PROJECT="$(dirname "$(jq -r '.config.master_source' "$PLAN")")"
+
+# The touched files: every distinct target_bib of a written entry, plus the tracking file.
+mapfile -t TOUCHED < <(jq -r '
+  ([.worklist[] | select(.status=="written") | .target_bib]
+   + [.config.tracking_file])
+  | map(select(. != null and . != "")) | unique | .[]' "$PLAN")
+N=$(jq -r '[.worklist[] | select(.status=="written")] | length' "$PLAN")
+
+if [ "$N" -eq 0 ]; then
+  echo "[finalize] nothing approved/written — no commit."
+elif git -C "$PROJECT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  ( cd "$PROJECT" && git add -- "${TOUCHED[@]}" \
+      && git commit -q -m "bib: add $N reference(s) ($(jq -r '[.worklist[]|select(.status=="written")|.citekey]|join(", ")' "$PLAN"))" )
+else
+  echo "[finalize] $PROJECT is not a git repo — wrote the .bib in place, skipping commit."
+fi
+```
+
+If verify did NOT pass (an unresolved written key or a new error), do NOT commit:
+leave the `.bib`(s) unstaged and ESCALATE. The scratch `plan.json` (with the
+drafted-but-unapproved BibTeX) is under `$TMPDIR` and is NEVER committed.
+
+**Close the formula step.**
+```bash
+if [ -n "${GC_BEAD_ID:-}" ]; then
+  gc bd update "$GC_BEAD_ID" --set-metadata gc.outcome=pass --status=closed \
+    --notes "Added $N approved reference(s) to $PROJECT; committed touched .bib(s)/tracking (no push); deferrals recorded. See plan.json."
+fi
+```
+
+Exit criteria: every approved entry is written and resolves, the touched files are
+committed (not pushed) when the project is a git repo, deferrals are recorded, and
+the formula step is closed.
+'''
+needs = ["verify"]
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
