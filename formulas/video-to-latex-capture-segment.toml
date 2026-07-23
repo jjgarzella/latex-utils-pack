@@ -1,0 +1,97 @@
+description = '''
+Pass-1 per-segment capture sub-formula invoked via `bd mol bond` from
+video-to-latex's spawn-capture-segments step. For a single video segment, runs
+faster-whisper (or equivalent) on the audio slice AND reads the segment's key frame
+images with a VLM to extract board content as LaTeX, then merges both into a
+`pass1/segment_<id>.json` record. ASR and VLM OCR are independent — can run in
+parallel within this sub-formula. Completion of this sub-formula's tip bead signals
+pass-1 done for this segment.
+'''
+formula = "video-to-latex-capture-segment"
+version = 2
+
+[requires]
+formula_compiler = ">=2.0.0"
+
+[vars]
+
+[vars.segment_id]
+description = "Zero-padded three-digit segment identifier (e.g. '007'). Used in all output filenames."
+required = true
+
+[vars.segment_t_start]
+description = "Start timestamp of the segment in seconds (float, e.g. '764.0'). Absolute offset into the video/audio."
+required = true
+
+[vars.segment_t_end]
+description = "End timestamp of the segment in seconds."
+required = true
+
+[vars.key_frames]
+description = "Comma-separated absolute paths to this segment's key frame PNGs (one primary; zero or more pre-erase supplementary). Order: primary first, then supplementary in time order."
+required = true
+
+[vars.paper_dir]
+description = "Absolute path to the top-level paper_dir (same as the parent formula's paper_dir)."
+required = true
+
+[vars.asr_engine]
+description = "Transcription backend: faster-whisper | whisper-cpp | openai-api."
+required = false
+default = "faster-whisper"
+
+[[steps]]
+id = "slice-audio"
+title = "Slice segment {{segment_id}} audio from audio.wav"
+description = '''
+Run `ffmpeg -y -ss {{segment_t_start}} -to {{segment_t_end}} -i {{paper_dir}}/audio.wav -c copy {{paper_dir}}/pass1/audio_{{segment_id}}.wav`. Create `{{paper_dir}}/pass1/` if missing. Fail if the output file is < 1KB. Use absolute paths; do NOT cd.
+'''
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "transcribe-segment"
+title = "Transcribe audio_{{segment_id}}.wav with {{asr_engine}}"
+needs = ["slice-audio"]
+description = '''
+Run: `python3 {{.CityRoot}}/packs/latex-utils/assets/scripts/video-to-latex/transcribe.py --paper-dir {{paper_dir}} --segment-id {{segment_id}} --audio {{paper_dir}}/pass1/audio_{{segment_id}}.wav --engine {{asr_engine}}`. Emits `{{paper_dir}}/pass1/segment_{{segment_id}}.transcript.json` with shape `{segment_id, engine, language, text, segments: [{start, end, text}, ...]}`. Runs in parallel with read-boards-segment (no dependency between them).
+'''
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "read-boards-segment"
+title = "VLM-read key frames for segment {{segment_id}} into LaTeX"
+needs = ["slice-audio"]
+description = '''
+For this step, YOU are the VLM. The comma-separated absolute paths in {{key_frames}} point to PNG images of the blackboard (or slide) at key moments in this segment. Use the Read tool to open each image and then write a LaTeX transcription of the mathematical content to `{{paper_dir}}/pass1/segment_{{segment_id}}.board.tex`.
+
+Guidance:
+- Transcribe math as compilable LaTeX using the notation the lecturer actually wrote. Preserve exact symbols (e.g., if they wrote ℂ use \mathbb{C}; if 𝒞 use \mathcal{C}).
+- If multiple key frames are supplied, transcribe each in order, separated by `% --- keyframe N ---` comment lines.
+- Flag any illegible portion with a `% ILLEGIBLE: <brief-description>` comment.
+- Use display math (`\[ ... \]` or `\begin{align} ... \end{align}`) for centered equations; inline math for symbols that appear in prose.
+- DO NOT add prose explanation — this file is a literal transcription of what's on the board. The polish pass will add exposition.
+- If the board is empty (e.g., just erased, or between topics), write `% empty board`.
+
+Write the file even if empty. This step runs in parallel with transcribe-segment WITHIN a single segment's molecule. However, across segments, the orchestrating agent MUST NOT run multiple read-boards-segment VLM subagents in parallel — doing so causes client-side CPU contention with the concurrent faster-whisper transcription (drops per-segment ASR from ~1.5x to ~0.1x realtime). Process segments' VLM reads one at a time, or run all transcription to completion first and then fan out VLM reads.
+'''
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "compile-segment-record"
+title = "Merge transcript + board OCR into segment_{{segment_id}}.json"
+needs = ["transcribe-segment", "read-boards-segment"]
+description = '''
+Read `{{paper_dir}}/pass1/segment_{{segment_id}}.transcript.json` (J) and `{{paper_dir}}/pass1/segment_{{segment_id}}.board.tex` (B). Produce `{{paper_dir}}/pass1/segment_{{segment_id}}.json` with fields:
+  - segment_id: "{{segment_id}}"
+  - t_start: {{segment_t_start}}
+  - t_end: {{segment_t_end}}
+  - key_frames: [list of abs paths from {{key_frames}}]
+  - audio_transcript: J.text (plain text, concatenated whisper segments)
+  - audio_segments: J.segments (for timestamped access in the faithful transcript step)
+  - board_tex: B (entire file contents as a string)
+  - section_hint: a 3–8 word topic label you infer from the transcript + board (e.g. 'Definition of analytic ring')
+  - brief_summary: a 1–2 sentence summary of what was covered in this segment
+
+Write the merged JSON. The section_hint and brief_summary let the pass-2 polish meta-step plan \section groupings without having to re-read the whole transcript.
+'''
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }

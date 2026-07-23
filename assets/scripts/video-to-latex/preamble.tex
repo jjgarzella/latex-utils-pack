@@ -1,0 +1,38 @@
+\documentclass{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath, amssymb, amsthm, mathtools}
+\usepackage{stmaryrd}          % \llbracket, \rrbracket
+\usepackage{graphicx}
+\usepackage{geometry}
+\usepackage{tikz}
+\usepackage{tikz-cd}           % tikzcd diagrams + \arrow in diagrams
+\usepackage{hyperref}
+\usepackage[capitalize,noabbrev]{cleveref} % \Cref, \cref
+\usepackage{enumitem}
+\geometry{margin=1in}
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{corollary}[theorem]{Corollary}
+
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{example}[theorem]{Example}
+\newtheorem{construction}[theorem]{Construction}
+
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+\newtheorem{note}[theorem]{Note}
+\newtheorem{exercise}[theorem]{Exercise}
+\newtheorem{setup}[theorem]{Setup}
+\newtheorem{claim}[theorem]{Claim}
+
+% Triple arrows for cosimplicial diagrams (Z -> (π_0)* Z => (π_1)* Z ...)
+\providecommand{\triplearrows}{\mathrel{\substack{\longrightarrow\\[-0.4ex]\longrightarrow\\[-0.4ex]\longrightarrow}}}
+\providecommand{\rightthreearrows}{\triplearrows}
+\providecommand{\longhookrightarrow}{\hookrightarrow}
+
+\providecommand{\tightlist}{\setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
