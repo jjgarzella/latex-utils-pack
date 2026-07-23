@@ -1,0 +1,166 @@
+formula = "litsearch-process-paper"
+version = 2
+description = '''
+Process a single arXiv paper as part of an arxiv-lit-search. Downloads the paper,
+extracts the introduction, classifies each cited reference as in-scope or out-of-scope
+via the {{scope}} paragraph, appends nodes and edges to the parent search's deps.dot,
+and recursively bonds a new litsearch-process-paper molecule for each in-scope unseen
+frontier citation. Bond this formula from the parent arxiv-lit-search formula — do NOT
+pour it directly. The real citation tree is preserved in deps.dot.
+'''
+
+[requires]
+formula_compiler = ">=2.0.0"
+
+[vars.arxiv_id]
+description = "The arXiv ID of the paper to process (e.g. '2301.07041'). Bare ID only, no prefix. Must be arXiv-resolvable — non-arXiv references are never bonded as molecules; they are recorded as leaf nodes in deps.dot by the parent molecule that cited them."
+required = true
+
+[vars.parent_slug]
+description = "Slug of the parent arxiv-lit-search (the one that owns papers/{{parent_slug}}/). All shared state (deps.dot, seen.txt, .deps.lock) lives under papers/{{parent_slug}}/."
+required = true
+
+[vars.scope]
+description = "The in-scope judgment paragraph from the parent search. Used verbatim when classifying every \\cite{} in this paper's introduction as in-scope or out-of-scope."
+required = true
+
+[vars.date_cap]
+description = "Earliest publication year to enqueue as a new frontier paper. Older papers still get recorded as (gray) nodes in deps.dot but are not bonded as molecules."
+required = false
+default = "1990"
+
+[vars.hard_cap]
+description = "Cap on total nodes in deps.dot. When the node count reaches hard_cap, this molecule no-ops (records 'skip — cap hit' and exits). Overshoot bounded by parallelism is accepted — the cap is mark-then-release-then-append, not atomic."
+required = false
+default = "100"
+
+[vars.root_bead]
+description = "The bead ID of the parent arxiv-lit-search molecule's seed-fanout step. Passed through at every recursion depth so downstream molecules share a consistent root anchor."
+required = true
+
+[[steps]]
+id = "check-caps-and-dedup"
+title = "Check caps and dedup for {{arxiv_id}}"
+type = "task"
+priority = 1
+description = '''
+Open a flock on papers/{{parent_slug}}/.deps.lock for the duration of this step. Under the lock:
+
+1. If papers/{{parent_slug}}/seen.txt already contains a line equal to {{arxiv_id}}: record 'skip — already processed by another molecule' as notes on this bead and mark `skip: true`; write nothing to deps.dot or seen.txt; close this bead successfully.
+2. Count node lines in papers/{{parent_slug}}/deps.dot (grep-count of lines matching the node pattern `  "`). If count >= {{hard_cap}}: record 'skip — hard_cap reached ({{hard_cap}})' as notes; mark `skip: true`; close this bead successfully.
+3. Otherwise: append `{{arxiv_id}}\n` to papers/{{parent_slug}}/seen.txt (reserving the slot under the lock) and record `skip: false` as notes.
+
+Release the lock. All subsequent steps in this molecule MUST read this bead's notes for the skip flag and early-exit if true.
+'''
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "download-paper"
+title = "Download arXiv source for {{arxiv_id}}"
+type = "task"
+priority = 1
+needs = ["check-caps-and-dedup"]
+description = '''
+Read check-caps-and-dedup's notes. If skip=true, record 'skipped per upstream' and close this bead successfully.
+
+Otherwise: if papers/{{arxiv_id}}/ already contains a .tex file, record 'already present, reusing' and close.
+
+Otherwise download and unpack the arXiv source directly (inline — do NOT use any separate download-arxiv formula or helper script):
+
+1. Create the directory: `mkdir -p papers/{{arxiv_id}}`
+2. Download: `curl -L https://arxiv.org/e-print/{{arxiv_id}} -o papers/{{arxiv_id}}/source.gz`
+3. Detect format with `file papers/{{arxiv_id}}/source.gz`:
+   - If gzipped-tar: `tar -xzf papers/{{arxiv_id}}/source.gz -C papers/{{arxiv_id}}/ && rm papers/{{arxiv_id}}/source.gz`
+   - If single gzipped file: `gunzip papers/{{arxiv_id}}/source.gz && mv papers/{{arxiv_id}}/source papers/{{arxiv_id}}/paper.tex`
+4. Never `cd` — use runtime-relative paths throughout.
+
+If the download returns HTML or the unpack fails, record the error as notes on this bead and mark `download_failed: true` for downstream steps to early-exit, but close this bead successfully so the parent's all-children gate is not blocked forever by a single bad paper.
+'''
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "extract-intro"
+title = "Extract introduction from {{arxiv_id}}"
+type = "task"
+priority = 1
+needs = ["download-paper"]
+description = '''
+Read check-caps-and-dedup and download-paper notes. If skip=true or download_failed=true, early-exit with 'skipped'.
+
+Otherwise: identify the main .tex file (the one containing \begin{document}; prefer one also containing \title if multiple). Locate \section{Introduction} or \section*{Introduction} (case-insensitive; also accept 'Introduction and main results', 'Background', etc.) and capture text up to the next top-level \section. If no explicit Introduction heading exists, take from \begin{document} to the first \section. Write the extracted text to papers/{{arxiv_id}}/intro.txt.
+
+Record success/failure (`intro_extracted: true|false`) as notes on this bead.
+'''
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "classify-citations"
+title = "Classify citations in {{arxiv_id}}'s intro as in-scope or out-of-scope"
+type = "task"
+priority = 1
+needs = ["extract-intro"]
+description = '''
+Read prior notes — early-exit if skip=true or intro_extracted=false.
+
+Otherwise: find every \cite{bibkey} in papers/{{arxiv_id}}/intro.txt. For each citation key, look up its entry in the paper's .bbl file or \bibitem blocks (in the main .tex or adjacent .bbl in papers/{{arxiv_id}}/); extract authors, year, title, and any arXiv ID or URL.
+
+Judge each reference IN-SCOPE vs OUT-OF-SCOPE using the {{scope}} paragraph as sole criterion:
+- IN-SCOPE: the cited paper itself studies the same subject/methodology per the scope description
+- OUT-OF-SCOPE: generic foundations, unrelated application, tool-used-but-not-about, etc.
+When in doubt, consider the sentence surrounding the \cite and the cited paper's title.
+
+Write papers/{{arxiv_id}}/notes.md containing:
+1. A 2–5 sentence summary of this paper (from intro)
+2. An 'In-scope citations' list: one line per entry `bibkey — <arxiv-id-if-known> — <1-line why-in-scope>`
+3. An 'Out-of-scope citations' list: `bibkey — <1-line why-not>`
+
+Record on THIS bead as structured notes:
+- `all_classified`: every citation with author/year/title/arxiv_id-if-known/in_scope-bool
+- `new_frontier`: filtered list (arxiv-resolvable AND in_scope AND year >= {{date_cap}} AND NOT in papers/{{parent_slug}}/seen.txt right now)
+
+Re-check seen.txt under flock when computing new_frontier — another molecule may have added entries in the meantime.
+'''
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[[steps]]
+id = "append-to-graph"
+title = "Append {{arxiv_id}}'s citations to deps.dot and fan out to new frontier"
+type = "task"
+priority = 1
+needs = ["classify-citations"]
+description = '''
+Read prior notes. If skip=true or all_classified is empty, emit `gc.output_json = {"new_frontier": []}` and close successfully — the on_complete fan-out will be a no-op, terminating this BFS branch.
+
+Otherwise: take flock on papers/{{parent_slug}}/.deps.lock for the duration of this step. Under lock, for each entry in all_classified decide the node shape:
+
+(a) Already present in deps.dot (grep for its slug) → append edge only:
+      `  "paper-{{arxiv_id}}" -> "<cited-slug>";`
+(b) arXiv-resolvable, in_scope, year >= {{date_cap}}, not in seen.txt → append a normal node:
+      `  "paper-<cited-arxiv-id>" [label="<AuthorLast YYYY>\n<short-title>", shape=box];`
+    AND the edge, AND add the arxiv id to seen.txt (reserving it for recursion).
+(c) arXiv-resolvable but year < {{date_cap}} → append node with `color=gray` and the edge; no seen.txt entry.
+(d) Non-arXiv → append node with `shape=ellipse, style=dashed` and the edge; no seen.txt entry.
+
+Slugs: `paper-<arxiv-id-dotless>` for arXiv (replace `.` with `-`), or `nonarxiv-<authorlast>-<year>-<title-slug>` for non-arXiv. Out-of-scope citations are NOT added to deps.dot — they live only in notes.md for audit.
+
+Release the lock.
+
+Set `gc.output_json` on this bead to:
+  {"nodes_added": <count>, "edges_added": <count>, "new_frontier": [{"arxiv_id": "<id>", "title": "<title>", "year": <year>}, ...]}
+
+new_frontier contains ONLY items newly reserved in seen.txt during this step (case b above). Items already in seen.txt before this step started are excluded. An empty new_frontier terminates this BFS branch naturally.
+'''
+metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
+
+[steps.on_complete]
+for_each = "output.new_frontier"
+bond = "litsearch-process-paper"
+parallel = true
+
+[steps.on_complete.vars]
+arxiv_id = "{item.arxiv_id}"
+parent_slug = "{{parent_slug}}"
+scope = "{{scope}}"
+date_cap = "{{date_cap}}"
+hard_cap = "{{hard_cap}}"
+root_bead = "{{root_bead}}"
