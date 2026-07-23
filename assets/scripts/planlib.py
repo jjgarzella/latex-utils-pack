@@ -34,6 +34,7 @@ from datetime import datetime, timezone
 
 SCHEMA_VERSION = "1"
 FORMULA = "mol-latex-concat"
+FORMULA_BIB = "add-bib-references"
 
 # plan.schema.json sits one directory up from assets/scripts/.
 SCHEMA_PATH = os.path.normpath(
@@ -63,6 +64,35 @@ def new(sources, dest="", tex_engine="pdflatex") -> dict:
         "preamble": {"packages_hoisted": [], "packages_dropped": []},
         "renames": {"macros": [], "labels": [], "bib_keys": []},
         "bib": {},
+        "flags": [],
+        "log": [],
+    }
+
+
+def new_bib_plan(*, published_bib="", preprints_bib="", master_source="",
+                 build_command="", single_bib=False, tracking_file=None,
+                 vars=None) -> dict:
+    """Build a fresh, schema-valid skeleton plan for an add-bib-references run.
+
+    The load-context step seeds the resolved `config` (auto-detected paths) and the
+    echoed `vars`; find_undefined_cites.py fills `worklist`; the baseline-compile step
+    fills `baseline`; confirm-and-write flips each worklist entry to `written`. Kept
+    here (beside `new`) so the seed step and the standalone helper tests build the same
+    on-disk shape."""
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "formula": FORMULA_BIB,
+        "vars": dict(vars) if vars else {},
+        "config": {
+            "published_bib": published_bib,
+            "preprints_bib": preprints_bib,
+            "master_source": master_source,
+            "build_command": build_command,
+            "single_bib": bool(single_bib),
+            "tracking_file": tracking_file,
+        },
+        "baseline": {"errors": [], "undefined": []},
+        "worklist": [],
         "flags": [],
         "log": [],
     }

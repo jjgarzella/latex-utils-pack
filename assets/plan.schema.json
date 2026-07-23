@@ -1,11 +1,11 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://github.com/jjgarzella/latex-utils-pack/plan.schema.json",
-  "title": "mol-latex-concat plan.json",
-  "description": "The agent<->script contract for the mol-latex-concat formula. The inspect step seeds it; every later helper READS and EXTENDS it; write_report.py renders REPORT.md from it. One file on disk, shared across the formula's single session. Helpers are testable in isolation: feed a plan.json + sources, assert the extended plan.json. Objects are deliberately open (additionalProperties:true) so a downstream helper may add fields without a schema bump; only the load-bearing keys are required.",
+  "title": "latex-utils plan.json",
+  "description": "The agent<->script contract for the latex-utils formulas. A seed step seeds it; every later helper READS and EXTENDS it; write_report.py renders REPORT.md from it. One file on disk, shared across the formula's single session. Helpers are testable in isolation: feed a plan.json + fixtures, assert the extended plan.json. Objects are deliberately open (additionalProperties:true) so a downstream helper may add fields without a schema bump; only the load-bearing keys are required. Two formulas share this contract: mol-latex-concat (source concatenation: vars.sources + the sources[] inventory) and add-bib-references (add BibTeX entries: config + worklist). The formula-specific required keys are enforced conditionally at the bottom of this schema so a plan is validated against exactly the shape its formula needs.",
   "type": "object",
   "additionalProperties": true,
-  "required": ["schema_version", "formula", "vars", "sources", "flags", "log"],
+  "required": ["schema_version", "formula", "vars", "flags", "log"],
   "properties": {
     "schema_version": {
       "type": "string",
@@ -14,28 +14,41 @@
     },
     "formula": {
       "type": "string",
-      "const": "mol-latex-concat"
+      "description": "Which latex-utils formula owns this plan. Selects the conditional required-key set below.",
+      "enum": ["mol-latex-concat", "add-bib-references"]
     },
     "vars": {
       "type": "object",
-      "description": "The formula vars as resolved for this run (echoed so helpers and the report are self-contained).",
+      "description": "The formula vars as resolved for this run (echoed so helpers and the report are self-contained). The required subset is formula-specific (see the conditional block at the bottom): mol-latex-concat requires sources + tex_engine; add-bib-references vars are all optional (empty => auto-detect).",
       "additionalProperties": true,
-      "required": ["sources", "tex_engine"],
       "properties": {
         "sources": {
           "type": "array",
-          "description": "Ordered list of source document directories. Order == chapter order.",
+          "description": "mol-latex-concat: ordered list of source document directories. Order == chapter order.",
           "items": { "type": "string" }
         },
         "dest": {
           "type": "string",
-          "description": "Destination project dir. Empty string => a fresh blank merged-latex/ is created."
+          "description": "mol-latex-concat: destination project dir. Empty string => a fresh blank merged-latex/ is created."
         },
         "tex_engine": {
           "type": "string",
-          "description": "TeX engine for the compile gate.",
+          "description": "mol-latex-concat: TeX engine for the compile gate.",
           "enum": ["pdflatex", "xelatex", "lualatex"]
-        }
+        },
+        "references": {
+          "type": "array",
+          "description": "add-bib-references: the citation keys to add. Empty => ALL undefined \\cite keys; set => only these (still added even if not yet \\cite'd).",
+          "items": { "type": "string" }
+        },
+        "published_bib": { "type": "string", "description": "add-bib-references var: path to the published-work .bib (empty => auto-detect)." },
+        "preprints_bib": { "type": "string", "description": "add-bib-references var: path to the preprints .bib (empty => auto-detect / share the single .bib)." },
+        "master_source": { "type": "string", "description": "add-bib-references var: the \\documentclass master .tex whose \\input/\\include tree is scanned for cites (empty => auto-detect)." },
+        "tracking_file": { "type": "string", "description": "add-bib-references var: optional checklist file to reconcile against (empty => skip)." },
+        "build_command": { "type": "string", "description": "add-bib-references var: compile command for the gate (empty => auto-detect)." },
+        "discover_target": { "type": "string", "description": "add-bib-references var: routing for the discover step (empty => run in-session)." },
+        "confirm_target": { "type": "string", "description": "add-bib-references var: routing for the human-gated confirm step (empty => run in-session)." },
+        "reviewer": { "type": "string", "description": "add-bib-references var: who the entries are presented to for approval (empty => the confirming session / overseer)." }
       }
     },
     "dest": {
@@ -256,6 +269,78 @@
           "summary": { "type": "string" }
         }
       }
+    },
+    "config": {
+      "type": "object",
+      "description": "add-bib-references: the resolved run configuration (vars auto-detected to concrete paths), echoed so every helper reads the same target .bib(s) and master source. Seeded by the load-context step.",
+      "additionalProperties": true,
+      "properties": {
+        "published_bib": { "type": "string", "description": "Resolved path to the .bib that holds published/thesis entries. In single_bib mode this equals preprints_bib (the one shared .bib)." },
+        "preprints_bib": { "type": "string", "description": "Resolved path to the .bib that holds preprint entries. In single_bib mode this equals published_bib." },
+        "master_source": { "type": "string", "description": "Resolved \\documentclass master .tex; its \\input/\\include tree is scanned for \\cite keys." },
+        "build_command": { "type": "string", "description": "Resolved compile command for the verify gate." },
+        "single_bib": { "type": "boolean", "description": "true => one .bib holds both published and preprint entries, separated by comment-section headers; false => two distinct .bib files routed by classification." },
+        "tracking_file": { "type": ["string", "null"], "description": "Optional checklist file to reconcile the worklist against; null/absent => no tracking bookkeeping." }
+      }
+    },
+    "baseline": {
+      "type": "object",
+      "description": "add-bib-references: the pre-edit compile state, captured once up front by the baseline-compile step (verify.py) so a later failure is attributable to our edits rather than a pre-existing defect.",
+      "additionalProperties": true,
+      "properties": {
+        "errors": {
+          "type": "array",
+          "description": "Compile errors/fatal warnings present BEFORE any entry was added (from the engine log).",
+          "items": { "type": "string" }
+        },
+        "undefined": {
+          "type": "array",
+          "description": "Undefined-citation keys present BEFORE any entry was added (verify.py 'Citation `key' ... undefined' log parse). Cross-checks the source-scan worklist.",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "worklist": {
+      "type": "array",
+      "description": "add-bib-references: one entry per reference to add, in discovery order. Seeded by find_undefined_cites.py (all undefined \\cite keys, or the explicit references var); the discover step fills classification/citekey/target_bib/bibtex/verify_url; confirm-and-write flips status to written once the entry is inserted.",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["key"],
+        "properties": {
+          "key": { "type": "string", "description": "The \\cite key referenced in the source (the worklist's stable identity)." },
+          "status": {
+            "type": "string",
+            "description": "Lifecycle: pending (seeded) -> approved (human said yes) -> written (inserted into the .bib); or deferred/escalated (not written, recorded with a note).",
+            "enum": ["pending", "approved", "deferred", "escalated", "written"]
+          },
+          "classification": {
+            "type": ["string", "null"],
+            "description": "How the work is published; routes the target .bib in two-bib mode / the section in single-bib mode. thesis is filed with published.",
+            "enum": ["published", "preprint", "thesis", null]
+          },
+          "citekey": { "type": ["string", "null"], "description": "The BibTeX key of the drafted entry (may differ from `key` if the project convention renames it)." },
+          "target_bib": { "type": ["string", "null"], "description": "Resolved .bib path the entry is written into." },
+          "bibtex": { "type": ["string", "null"], "description": "The full BibTeX entry text (drafted at discover, inserted verbatim at confirm)." },
+          "verify_url": { "type": ["string", "null"], "description": "Clickable link the reviewer uses to verify the entry (publisher/DOI page)." },
+          "note": { "type": ["string", "null"], "description": "Free-text context: why deferred/escalated, source of the entry, reconciliation with the tracking file, etc." }
+        }
+      }
     }
-  }
+  },
+  "allOf": [
+    {
+      "description": "mol-latex-concat plans keep the original strict shape: vars.sources + tex_engine and the per-source inventory.",
+      "if": { "properties": { "formula": { "const": "mol-latex-concat" } } },
+      "then": {
+        "required": ["sources"],
+        "properties": { "vars": { "required": ["sources", "tex_engine"] } }
+      }
+    },
+    {
+      "description": "add-bib-references plans carry a resolved config and a worklist instead of a source inventory.",
+      "if": { "properties": { "formula": { "const": "add-bib-references" } } },
+      "then": { "required": ["config", "worklist"] }
+    }
+  ]
 }
