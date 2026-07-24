@@ -1,0 +1,192 @@
+formula = "arxiv-lit-search"
+version = 2
+description = '''
+Conduct a saturating literature search around seed papers or a topic/methodology.
+Given {{seed}}, a free-text {{scope}} paragraph, an earliest-year {{date_cap}}, and
+caps {{max_papers}} (total graph nodes) and {{max_depth}} (BFS recursion depth),
+perform a breadth-first citation crawl: for each seed paper, download the arXiv source,
+read the intro, classify cited references as in-scope or out-of-scope, and recursively
+bond a litsearch-process-paper molecule for each in-scope unseen citation up to
+max_depth levels deep. Maintains a Graphviz dependency graph incrementally. Produces
+thematic synthesis summary.md, deps.png, and beads-export.md. All outputs under
+papers/{{slug}}/; individual papers under papers/<arxiv-id>/. Always format math in
+$...$ or $$...$$ (dollar signs only, no backticks, no \\(...\\) or \\[...\\]). Spell
+out standard macros explicitly (\\mathbb{Q}, \\mathbb{Z}, \\mathbb{F}_p, \\mathcal{O}_X,
+etc.) rather than paper-local shortcuts.
+'''
+
+[requires]
+formula_compiler = ">=2.0.0"
+
+[vars.slug]
+description = "Short kebab-case name for this literature search (e.g. 'zeta-of-varieties'). Used as the output dir name under papers/. Filesystem-safe: lowercase ASCII, hyphens, no spaces or dots."
+required = true
+
+[vars.seed]
+description = "Seed input. Accepts (a) one or more arXiv IDs/URLs, comma-separated; (b) one or more paper titles; (c) a free-text topic/methodology description."
+required = true
+
+[vars.scope]
+description = "Free-text paragraph defining what counts as an in-scope citation. Used verbatim as the sole criterion when classifying every \\cite{} found in every paper's introduction. Be precise about both inclusions and exclusions."
+required = true
+
+[vars.date_cap]
+description = "Earliest publication year to enqueue as a new frontier paper. Older papers are recorded as gray leaf nodes in deps.dot but never bonded as molecules. Default 1990."
+required = false
+default = "1990"
+
+[vars.max_papers]
+description = "Cap on total papers (nodes) in the BFS graph. Passed to child molecules as hard_cap. Stops new-molecule bonding once the node count is reached. Overshoot bounded by parallelism is accepted. Default 40."
+required = false
+default = "40"
+
+[vars.max_depth]
+description = "Maximum BFS recursion depth. 0 = process seeds only with no further recursion; N = follow citations N levels deep. Decremented by 1 at each depth level; child molecules terminate the branch when it reaches 0. Default 3."
+required = false
+default = "3"
+
+[[steps]]
+id = "scope-job"
+title = "Scope literature-search job for {{slug}}"
+type = "task"
+priority = 1
+description = '''
+Validate {{slug}} is kebab-case (lowercase ASCII + hyphens only, no dots or spaces). Run `mkdir -p papers/{{slug}}` relative to the current working directory. Record on this bead, as structured notes: the absolute path to papers/{{slug}}/, the {{scope}} paragraph verbatim, the integer {{date_cap}}, the integer {{max_papers}}, the integer {{max_depth}}, the raw {{seed}} string. Every subsequent step reads these values from this bead's notes rather than re-deriving from formula vars.
+'''
+
+[[steps]]
+id = "resolve-seeds"
+title = "Resolve {{seed}} into concrete seed papers"
+type = "task"
+priority = 1
+needs = ["scope-job"]
+description = '''
+Classify {{seed}}: (a) arXiv IDs or URLs → strip to bare IDs; (b) titles → resolve each via `https://export.arxiv.org/api/query?search_query=ti:"<title>"`; (c) topic/methodology description → run BOTH a web search AND an arXiv listing search (`search_query=all:<keywords>&max_results=50&sortBy=relevance`) to find 5–10 candidates, then present to the user via AskUserQuestion and confirm 3–5 seeds. In cases (a) and (b), confirmation is optional unless more than one paper has the same title. Record on this bead, as structured notes: the final confirmed seed list as a list of `{arxiv_id, title}` objects. Non-arxiv seeds are allowed but rare — record them separately with title/authors/year; they will not be bonded as molecules but will be recorded as seed nodes in deps.dot. Emit `gc.output_json = {"seeds": [{"arxiv_id": "<id>", "title": "<title>"}, ...]}` with the confirmed arXiv seed list (non-arXiv seeds excluded from this list).
+'''
+
+[[steps]]
+id = "init-graph"
+title = "Initialize deps.dot, seen.txt, and .deps.lock for {{slug}}"
+type = "task"
+priority = 1
+needs = ["resolve-seeds"]
+description = '''
+Create papers/{{slug}}/deps.dot with preamble: `digraph litsearch {\n  rankdir=LR;\n  node [shape=box, fontname="Helvetica"];\n`. Do NOT close the brace — later steps and child molecules append to this file; close-and-render-graph will add the closing brace. For each seed from resolve-seeds's output.seeds, append a seed node line: `  "paper-<arxiv-id-dotless>" [label="<AuthorLast YYYY>\n<short-title>", shape=box, color=blue];` (arxiv-id-dotless replaces . with -). Seeds are color=blue to distinguish visually. Create papers/{{slug}}/seen.txt as an EMPTY file (`touch papers/{{slug}}/seen.txt`). Do NOT pre-populate seen.txt with seed IDs — each seed's litsearch-process-paper molecule claims its slot in check-caps-and-dedup under flock. Pre-populating causes check-caps-and-dedup to skip all seeds as "already processed." Create an empty papers/{{slug}}/.deps.lock (just `touch` it — it exists for `flock` to acquire). Record on this bead the seed-to-slug mapping as notes.
+'''
+
+[[steps]]
+id = "seed-fanout"
+title = "Record root-bead identity and trigger per-seed litsearch-process-paper fan-out"
+type = "task"
+priority = 1
+needs = ["init-graph"]
+description = '''
+This step is the root anchor for the entire BFS. Every recursive litsearch-process-paper molecule at every depth is bonded against this bead's ID (root_bead) via the root_bead var, so the tally gate catches the full tree.
+
+1. Determine this bead's own ID: run `bd mol current --json` or query `bd list --status=in_progress --json` and find the bead whose title matches this step's title; record the ID as root_bead_id.
+
+2. Read the confirmed arXiv seed list from resolve-seeds's gc.output_json (list of {arxiv_id, title} objects).
+
+3. Emit `gc.output_json` as:
+   {
+     "seeds": [
+       {
+         "arxiv_id": "<id>",
+         "title": "<title>",
+         "root_bead_id": "<root_bead_id>",
+         "max_depth": {{max_depth}}
+       },
+       ...
+     ]
+   }
+   Include one entry per confirmed arXiv seed. Non-arXiv seeds are NOT included (they are leaf nodes only, recorded by init-graph). The root_bead_id and max_depth fields are threaded through to all child molecules via on_complete.vars so they can propagate the root anchor and enforce recursion bounds.
+'''
+
+[steps.on_complete]
+for_each = "output.seeds"
+bond = "litsearch-process-paper"
+parallel = true
+
+[steps.on_complete.vars]
+arxiv_id = "{item.arxiv_id}"
+parent_slug = "{{slug}}"
+scope = "{{scope}}"
+date_cap = "{{date_cap}}"
+hard_cap = "{{max_papers}}"
+root_bead = "{item.root_bead_id}"
+max_depth = "{item.max_depth}"
+
+[steps.tally]
+mode = "any-pass"
+
+[[steps]]
+id = "await-saturation"
+title = "Confirm BFS saturation and collect statistics"
+type = "task"
+priority = 1
+needs = ["seed-fanout"]
+description = '''
+Unblocks only after the seed-fanout tally resolves — meaning every litsearch-process-paper molecule bonded to this search (directly or recursively) has completed. When this step runs, the BFS has saturated: every branch either ran out of in-scope citations, hit date_cap, hit max_papers (hard_cap), hit max_depth (depth reached 0), or was deduped.
+
+Record final statistics as notes on this bead:
+- count of molecules spawned (from `bd list --json` filtered by this molecule's epic)
+- count of completed vs failed
+- final deps.dot node count (grep -c of node lines) and edge count
+- bound reason: max_papers, max_depth, natural saturation, or mixed
+'''
+
+[[steps]]
+id = "close-and-render-graph"
+title = "Close deps.dot brace and render deps.png"
+type = "task"
+priority = 2
+needs = ["await-saturation"]
+description = '''
+Append a single `}` line to papers/{{slug}}/deps.dot. Run `dot -Tpng papers/{{slug}}/deps.dot -o papers/{{slug}}/deps.png`. If Graphviz is not installed, record the missing dependency as notes on this bead but do not fail — the .dot file is the authoritative artifact. Record final node count and edge count as notes.
+'''
+
+[[steps]]
+id = "synthesize-summary"
+title = "Write thematic synthesis at papers/{{slug}}/summary.md"
+type = "task"
+priority = 1
+needs = ["close-and-render-graph"]
+description = '''
+Read every papers/<arxiv-id>/notes.md produced by the litsearch-process-paper molecules. Cluster papers into themes — by methodology, object of study, era, or visible lineage in the citation graph (chains in deps.dot). Each paper lands in exactly one primary cluster. Write papers/{{slug}}/summary.md with:
+
+(1) **Scope.** The {{scope}} paragraph verbatim plus a one-paragraph narrative of how this search was conducted (seeds, exit reason — saturation or max_papers/max_depth cap, date_cap, final paper count).
+
+(2) **Narrative.** 3–8 paragraphs narrating how the subject evolved over the corpus — what the earliest (date_cap-era) papers established, what later ones built on them, what the current frontier looks like. Reference specific papers by title + arXiv ID. Ground every claim in an intro; do not invent.
+
+(3) **Thematic clusters.** One subsection per cluster. List member papers (title, year, arXiv ID) and a 2–4 sentence description of the cluster's unifying theme, drawing on the notes.md files.
+
+(4) **Per-paper table.** Markdown table: slug | title | year | arXiv | 1-line summary. Every paper in the graph (including date_cap gray leaves and non-arxiv dashed leaves) gets a row.
+
+Always format math in $...$ / $$...$$ — dollar signs only, no backticks, no escaped parens/brackets. Spell standard macros explicitly (\\mathbb{Q}, \\mathbb{Z}, \\mathbb{F}_p, \\mathcal{O}_X, \\mathfrak{p}, etc.) rather than paper-local shortcuts like \\Q, \\Z, \\F_p — those are typically \\newcommand definitions in the paper preamble and will not render in the markdown viewer.
+'''
+
+[[steps]]
+id = "emit-beads-export"
+title = "Emit papers/{{slug}}/beads-export.md for optional downstream beads ingestion"
+type = "task"
+priority = 2
+needs = ["await-saturation"]
+description = '''
+Produce a markdown file the user (or a downstream formula) can feed into beads to materialize the graph as real beads issues. Structure:
+
+(1) A `bash` code block with one `bd create --title="Paper: <AuthorLast YYYY> — <short-title>" --description="arxiv:<id>, <1-line summary>, <scope-classification: seed|expanded|leaf-by-date|leaf-non-arxiv>" --type=task --priority=3` line per node in deps.dot. CRITICAL: do NOT execute these — this formula is intentionally side-effect-free on the beads graph beyond the molecules the recursion spawned. The block is an unexecuted script so the user decides when/if to ingest.
+
+(2) A second `bash` code block with one `bd dep add <cited-bead-id> <citing-bead-id>` line per edge, using placeholder slugs that the user must fix up after running the create block. Add a leading comment explaining the two-phase ingestion.
+
+(3) A short 'How to use' preamble explaining the two phases and warning that running the create block twice creates duplicates (beads has no title-based idempotence).
+'''
+
+[[steps]]
+id = "review-artifacts"
+title = "Review the literature-search artifacts for {{slug}}"
+type = "task"
+priority = 2
+needs = ["synthesize-summary", "emit-beads-export"]
+description = '''
+Open papers/{{slug}}/summary.md, papers/{{slug}}/deps.dot, papers/{{slug}}/beads-export.md, and spot-check 2–3 random papers/<arxiv-id>/notes.md files. Verify: (1) every paper in summary.md's per-paper table has a corresponding node in deps.dot and a notes.md; (2) thematic clusters reflect claims grounded in intros, not invented; (3) scope judgments across notes.md files are consistent — the same kind of reference classified the same way, actually applying the {{scope}} paragraph; (4) seed papers marked color=blue in deps.dot; date_cap leaves gray; non-arxiv leaves dashed ellipses; (5) math in $...$ / $$...$$ form with standard macros spelled out; (6) beads-export.md is an unexecuted script, not a live command. Report any issues; otherwise confirm the artifact is ready.
+'''

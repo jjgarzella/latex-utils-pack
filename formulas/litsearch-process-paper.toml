@@ -38,6 +38,11 @@ default = "100"
 description = "The bead ID of the parent arxiv-lit-search molecule's seed-fanout step. Passed through at every recursion depth so downstream molecules share a consistent root anchor."
 required = true
 
+[vars.max_depth]
+description = "Maximum remaining recursion depth. 0 = process this paper but do not bond any new frontier papers (set new_frontier=[]). Decremented by 1 at each depth level; child molecules inherit depth_next from this step's gc.output_json."
+required = false
+default = "3"
+
 [[steps]]
 id = "check-caps-and-dedup"
 title = "Check caps and dedup for {{arxiv_id}}"
@@ -47,7 +52,7 @@ description = '''
 Open a flock on papers/{{parent_slug}}/.deps.lock for the duration of this step. Under the lock:
 
 1. If papers/{{parent_slug}}/seen.txt already contains a line equal to {{arxiv_id}}: record 'skip — already processed by another molecule' as notes on this bead and mark `skip: true`; write nothing to deps.dot or seen.txt; close this bead successfully.
-2. Count node lines in papers/{{parent_slug}}/deps.dot (grep-count of lines matching the node pattern `  "`). If count >= {{hard_cap}}: record 'skip — hard_cap reached ({{hard_cap}})' as notes; mark `skip: true`; close this bead successfully.
+2. Count lines in papers/{{parent_slug}}/seen.txt (`wc -l < papers/{{parent_slug}}/seen.txt`). If count >= {{hard_cap}}: record 'skip — hard_cap reached ({{hard_cap}})' as notes; mark `skip: true`; close this bead successfully. (Counting seen.txt entries rather than deps.dot nodes bounds the number of PROCESSED papers; deps.dot also contains graph-visualization nodes for citations that are not themselves processed.)
 3. Otherwise: append `{{arxiv_id}}\n` to papers/{{parent_slug}}/seen.txt (reserving the slot under the lock) and record `skip: false` as notes.
 
 Release the lock. All subsequent steps in this molecule MUST read this bead's notes for the skip flag and early-exit if true.
@@ -145,10 +150,12 @@ Slugs: `paper-<arxiv-id-dotless>` for arXiv (replace `.` with `-`), or `nonarxiv
 
 Release the lock.
 
-Set `gc.output_json` on this bead to:
-  {"nodes_added": <count>, "edges_added": <count>, "new_frontier": [{"arxiv_id": "<id>", "title": "<title>", "year": <year>}, ...]}
+Parse {{max_depth}} as an integer (call it `depth`). Compute `depth_next = max(0, depth - 1)`. If `depth == 0`, do NOT recurse: set new_frontier = [] regardless of what in-scope citations were found — this terminates the BFS branch at this level.
 
-new_frontier contains ONLY items newly reserved in seen.txt during this step (case b above). Items already in seen.txt before this step started are excluded. An empty new_frontier terminates this BFS branch naturally.
+Set `gc.output_json` on this bead to:
+  {"nodes_added": <count>, "edges_added": <count>, "new_frontier": [{"arxiv_id": "<id>", "title": "<title>", "year": <year>, "max_depth": <depth_next>}, ...]}
+
+new_frontier contains ONLY items newly reserved in seen.txt during this step (case b above) AND only when depth > 0. Each item carries `max_depth: depth_next` so the child molecule inherits the decremented depth. Items already in seen.txt before this step started are excluded. An empty new_frontier terminates this BFS branch naturally.
 '''
 metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }
 
@@ -164,3 +171,4 @@ scope = "{{scope}}"
 date_cap = "{{date_cap}}"
 hard_cap = "{{hard_cap}}"
 root_bead = "{{root_bead}}"
+max_depth = "{item.max_depth}"
