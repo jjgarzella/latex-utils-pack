@@ -1,0 +1,447 @@
+description = '''
+Convert one math-lecture YouTube video (or local file) into a compilable LaTeX project,
+preserving BOTH a faithful transcript (audio ASR + blackboard/slide OCR interleaved with
+timestamps) AND a cleaner mathematical rewrite (sectioned paper.tex). Designed for
+blackboard talks (v1); slide talks will also work but typeset-OCR branch is deferred to v2.
+
+Segmentation is camera-SHOT based (ffmpeg scene-change detection with auto-tuned threshold);
+sliding chalkboards register as scene changes identically to camera pans. Within-shot
+substantive erasures produce supplementary key frames so content is not silently lost.
+
+Per-segment pass-1 fan-out is via on_complete bond to video-to-latex-capture-segment and
+runs in parallel. Pass 2 polish is a single meta-step that iterates sequentially over
+segments, maintaining a running-context JSON in a beads wisp (notation table, defined
+terms, labels, section state, brief narrative) so per-call context is O(1) in segment
+count. At the end, squash-polish-wisp preserves the final context as a digest.
+
+Audience Q&A exchanges are formatted into a \\begin{remark}[Q\\&A]...\\end{remark}
+environment defined in the bundled preamble.
+
+Helpers live at: {{.CityRoot}}/packs/latex-utils/assets/scripts/video-to-latex/
+Schema for spawn-capture-segments gc.output_json:
+  {{.CityRoot}}/packs/latex-utils/assets/video-to-latex.plan.schema.json
+
+IMPORTANT: the Bash tool shares cwd across calls (including parallel calls).
+NEVER use 'cd' in any step; always use absolute paths or tool flags like '-C',
+'-output-directory', '-o'.
+
+IMPORTANT (pass-1 CPU contention): when asr_engine=faster-whisper is running (it pegs
+CPU on Apple Silicon / non-GPU hosts), do NOT run read-boards-segment VLM subagents in
+parallel. Parallel VLM subagents contend with the concurrent whisper inference and can
+slow transcription from ~1.5x to ~0.1x realtime. Run the VLM reads one segment at a
+time (serially).
+'''
+formula = "video-to-latex"
+version = 2
+
+[requires]
+formula_compiler = ">=2.0.0"
+
+[vars]
+
+[vars.paper_dir]
+description = "Absolute path to an existing directory where all output artifacts are written (audio.wav, segments.json, keyframes/, pass1/, pass2/, transcript.tex, body.tex, preamble.tex, paper.tex, build/paper.pdf, conversion.log). Must already exist; the formula does NOT create it."
+required = true
+
+[vars.video_url]
+description = "YouTube URL (or any yt-dlp-supported URL). One of video_url or video_path must be set. If both are set, video_path wins and no download is performed."
+required = false
+default = ""
+
+[vars.video_path]
+description = "Absolute path to a local video file (any format ffmpeg can read). One of video_url or video_path must be set."
+required = false
+default = ""
+
+[vars.tex_engine]
+description = "TeX engine used to compile the final paper.tex. One of: 'xelatex' (default — handles Unicode natively, recommended because VLM-transcribed math often contains Unicode math symbols), 'lualatex', 'pdflatex'."
+required = false
+default = "xelatex"
+
+[vars.asr_engine]
+description = "Speech-to-text backend. One of: 'faster-whisper' (default; pip install faster-whisper; first run downloads ~3GB large-v3 model), 'whisper-cpp' (brew install whisper-cpp), 'openai-api' (requires OPENAI_API_KEY)."
+required = false
+default = "faster-whisper"
+
+[vars.scene_threshold]
+description = "ffmpeg scene-change threshold for shot detection. 'auto' (default) sweeps {0.20, 0.25, 0.30, 0.35} and picks the one producing between min_segments and max_segments with no single shot longer than max_segment_sec. A specific float value like '0.25' skips the sweep."
+required = false
+default = "auto"
+
+[vars.max_segment_sec]
+description = "Hard cap on segment length in seconds. If a shot lasts longer, it gets force-split at this interval. Default 900 (15 min)."
+required = false
+default = "900"
+
+[vars.intro_trim_sec]
+description = "Seconds to trim from the START of the video before segmentation begins. Default 30, appropriate for IHES-style title-card intros. Scene events in the trimmed window are ignored."
+required = false
+default = "30"
+
+[vars.outro_trim_sec]
+description = "Seconds to trim from the END of the video. Default 0 — Q&A and closing remarks are kept. Set to a positive value to drop them."
+required = false
+default = "0"
+
+[vars.presentation_mode]
+description = "Either 'blackboard' (v1 default; handwritten chalk on physical boards, possibly sliding) or 'slides' (typeset slides; future-reserved — v1 treats slides the same as blackboard, which produces acceptable but suboptimal output for typeset content)."
+required = false
+default = "blackboard"
+
+[vars.preamble_path]
+description = "Absolute path to a custom preamble.tex. If empty, the bundled preamble at {{.CityRoot}}/packs/latex-utils/assets/scripts/video-to-latex/preamble.tex is used (article + amsmath/amssymb/amsthm/mathtools/hyperref + remark Q&A environment)."
+required = false
+default = ""
+
+[vars.min_segments]
+description = "Lower bound of acceptable segment count used by scene_threshold='auto'. Default 15."
+required = false
+default = "15"
+
+[vars.max_segments]
+description = "Upper bound of acceptable segment count used by scene_threshold='auto'. Default 40."
+required = false
+default = "40"
+
+[[steps]]
+id = "check-prereqs"
+title = "Verify prerequisites and resolve the input video"
+type = "task"
+priority = 1
+description = '''
+Verify prerequisites BEFORE any work.
+
+(1) `which yt-dlp` — on miss: 'brew install yt-dlp'.
+(2) `which ffmpeg ffprobe` — on miss: 'brew install ffmpeg'.
+(3) For asr_engine={{asr_engine}}:
+    'faster-whisper' -> `python3 -c 'import faster_whisper'`; on miss: 'pip install faster-whisper'
+    (FIRST RUN downloads ~3GB large-v3 model; warn the user).
+    'whisper-cpp' -> `which whisper-cli` or `which whisper-cpp`; on miss: 'brew install whisper-cpp'.
+    'openai-api' -> verify OPENAI_API_KEY is set and non-empty.
+(4) `which {{tex_engine}}` — on miss: 'brew install --cask mactex'.
+
+(5) Resolve the input video:
+    - If video_path ({{video_path}}) is set AND the file exists at that absolute path,
+      record 'INPUT_VIDEO=<abs-path>' as a note on this bead and SKIP downloading.
+    - Else if video_url ({{video_url}}) is set, run:
+        `yt-dlp -f bestvideo+bestaudio -o '{{paper_dir}}/video.%(ext)s' '{{video_url}}'`
+      then locate the produced file at `{{paper_dir}}/video.*` (extension typically mkv or mp4);
+      record its ABSOLUTE path as INPUT_VIDEO.
+    - Else BOTH empty → STOP with error.
+
+All subsequent steps MUST use INPUT_VIDEO from this bead's notes; do NOT assume a filename.
+If ANY prerequisite check fails, STOP — do not proceed.
+'''
+
+[[steps]]
+id = "extract-audio"
+title = "Extract mono 16kHz wav from the video"
+type = "task"
+priority = 2
+needs = ["check-prereqs"]
+description = '''
+Run:
+  `ffmpeg -y -i <INPUT_VIDEO> -ac 1 -ar 16000 -vn {{paper_dir}}/audio.wav`
+
+where <INPUT_VIDEO> is the absolute path recorded by check-prereqs. 16kHz mono is the
+standard whisper input. Append stdout/stderr to `{{paper_dir}}/conversion.log`. Fail the
+step if audio.wav is not produced or is < 1KB. Use absolute paths; do NOT cd.
+'''
+
+[[steps]]
+id = "calibrate-segmentation"
+title = "Auto-tune scene threshold and emit segments.json + keyframes"
+type = "task"
+priority = 2
+needs = ["extract-audio"]
+description = '''
+Run:
+  python3 {{.CityRoot}}/packs/latex-utils/assets/scripts/video-to-latex/calibrate_segments.py \
+    --paper-dir {{paper_dir}} \
+    --input-video <INPUT_VIDEO> \
+    --scene-threshold {{scene_threshold}} \
+    --intro-trim-sec {{intro_trim_sec}} \
+    --outro-trim-sec {{outro_trim_sec}} \
+    --max-segment-sec {{max_segment_sec}} \
+    --min-segments {{min_segments}} \
+    --max-segments {{max_segments}}
+
+Use absolute paths for all args. The helper:
+  (1) Runs ffmpeg scene detection at 480p/2fps with the threshold (or sweeps
+      {0.20, 0.25, 0.30, 0.35} if 'auto'), filters intro/outro windows, merges short
+      segments into neighbors, enforces max_segment_sec with forced splits, emits
+      `{{paper_dir}}/segments.json` = [{id, t_start, t_end, key_frames: [abs-paths]}, ...].
+  (2) Extracts the primary key frame (last stable frame before the next transition) for
+      each segment via ffmpeg to `{{paper_dir}}/keyframes/seg_<id>_main.png`.
+  (3) Runs within-shot ink-density scan (detect_ink_keyframes.py) to add supplementary
+      pre-erase key frames when substantive ink decreases occur inside a shot, written
+      as `seg_<id>_preerase_<N>.png`.
+  (4) Runs uniform time-sampling (uniform_sample_keyframes.py) at 90s intervals per
+      segment with 64-bit aHash perceptual-hash dedup against existing keyframes, written
+      as `seg_<id>_t<seconds>.png`.
+
+Record on this bead: the chosen threshold, total segment count, median and longest
+segment durations, and summary of supplementary + uniform keyframes added. If the chosen
+threshold is still outside [min_segments, max_segments], STOP with a clear message (user
+may need to override scene_threshold manually).
+'''
+
+[[steps]]
+id = "spawn-capture-segments"
+title = "Emit segments.json as structured output for pass-1 fan-out"
+type = "task"
+priority = 2
+needs = ["calibrate-segmentation"]
+description = '''
+Read `{{paper_dir}}/segments.json` (produced by calibrate-segmentation) and convert it
+into structured step output that drives the on_complete fan-out.
+
+Build a JSON object {"segments": [...]} where each element has:
+  - id:         zero-padded three-digit segment identifier (e.g. "007")
+  - t_start:    start timestamp in seconds (float)
+  - t_end:      end timestamp in seconds (float)
+  - key_frames: comma-separated absolute paths to this segment's key frame PNGs
+                (primary first, then supplementary in time order)
+
+Run this to build and stamp the output:
+
+  python3 - <<'PYEOF'
+  import json, os, sys
+  segs = json.load(open("{{paper_dir}}/segments.json"))
+  out = []
+  for s in segs:
+      out.append({
+          "id": s["id"],
+          "t_start": s["t_start"],
+          "t_end": s["t_end"],
+          "key_frames": ",".join(s["key_frames"]),
+      })
+  print(json.dumps({"segments": out}))
+  PYEOF
+
+Capture the printed JSON and stamp it on this bead:
+
+  gc bd update "$GC_BEAD_ID" --set-metadata "gc.output_json=$(python3 ...the above...)"
+
+The on_complete below will fan out one video-to-latex-capture-segment bond per segment
+entry in output.segments.
+'''
+
+[steps.on_complete]
+for_each = "output.segments"
+bond = "video-to-latex-capture-segment"
+parallel = true
+
+[steps.on_complete.vars]
+segment_id = "{item.id}"
+segment_t_start = "{item.t_start}"
+segment_t_end = "{item.t_end}"
+key_frames = "{item.key_frames}"
+paper_dir = "{{paper_dir}}"
+asr_engine = "{{asr_engine}}"
+
+[[steps]]
+id = "build-transcript-tex"
+title = "Build the faithful transcript.tex from pass-1 records"
+type = "task"
+priority = 2
+needs = ["spawn-capture-segments"]
+description = '''
+Run:
+  python3 {{.CityRoot}}/packs/latex-utils/assets/scripts/video-to-latex/build_transcript.py \
+    --paper-dir {{paper_dir}}
+
+The helper reads all `{{paper_dir}}/pass1/segment_*.json` files in segment-id order and
+emits `{{paper_dir}}/transcript.tex` consisting of: a top-level `\section*{Transcript}`
+header, then per segment a subsection 'Segment <id> (<t_start>–<t_end>)', then verbatim
+audio transcript text followed by the board OCR in a `\begin{verbatim}` block.
+
+Purely mechanical — no LLM. The transcript.tex file is meant to be compiled alongside
+preamble.tex for the user's visibility artifact (separate from paper.tex).
+
+Record on this bead: total segments included, total word count of audio transcript.
+'''
+
+[[steps]]
+id = "init-polish-wisp"
+title = "Create the polish-context wisp and initialize running-context JSON"
+type = "task"
+priority = 2
+needs = ["build-transcript-tex"]
+description = '''
+Run:
+  bd create \
+    --title="polish-context for {{paper_dir}}" \
+    --type=task \
+    --priority=3 \
+    --ephemeral \
+    --wisp-type=patrol \
+    --notes='{"notation":{},"defined_terms":[],"labels":[],"section_state":{"section":null,"subsection":null},"brief_narrative":""}' \
+    --json
+
+to create an EPHEMERAL wisp (not synced to Dolt; subject to TTL compaction). Record the
+returned wisp ID as 'wisp_id: <id>' in THIS bead's notes AND write the same id to
+`{{paper_dir}}/pass2/wisp_id.txt` (create pass2/ if missing).
+
+This wisp is the running-context holder — pass-2 reads and updates its notes JSON during
+its sequential loop. At end-of-pipeline, squash-polish-wisp closes the wisp via
+`bd close`; its final notes JSON is preserved on the closed bead.
+'''
+
+[[steps]]
+id = "polish-all-segments"
+title = "Sequentially polish each segment into body_segment_<K>.tex using the context bead"
+type = "task"
+priority = 2
+needs = ["init-polish-wisp"]
+description = '''
+This is the sequential pass-2 meta-step. Read `{{paper_dir}}/pass2/wisp_id.txt` to get
+the context bead id (call it WISP). Read `{{paper_dir}}/segments.json` to know the
+ordered list of segment ids.
+
+For each segment K in order (1..N):
+
+  1. `bd show <WISP> --json` -> parse the notes field's JSON into CTX.
+  2. Read `{{paper_dir}}/pass1/segment_<K>.json` into REC.
+  3. If `{{paper_dir}}/pass2/body_segment_<K>.tex` already exists and is non-empty,
+     SKIP to iteration K+1 (resume semantics).
+  4. Produce `body_segment_<K>.tex` using CTX + REC. Requirements:
+     - Use LaTeX consistent with CTX.notation (same macros for same concepts).
+     - Reference existing CTX.defined_terms instead of redefining.
+     - Open section/subsection per CTX.section_state; promote to new \section only when
+       topic clearly shifts.
+     - Detect audience Q&A in REC.audio_transcript (cues: lecturer restating with 'the
+       question is', 'you're asking'; OR a turn that appears out-of-the-blue and
+       conversational, even if the lecturer does not restate) and format each exchange as
+       `\begin{remark}[Q\&A] ... \end{remark}`.
+     - When board OCR (REC.board_tex) and audio disagree about a symbol/term, prefer
+       the board, and leave a comment `% board says X, audio says Y` in the source.
+     - Flag illegible OCR passages with `% ILLEGIBLE` comments retained.
+     - In theorem-environment optional titles that contain math using brackets (e.g.
+       `q^{\pm 1}]`, `D^{[n]}`), wrap the title content in extra braces
+       (`\begin{env}[{...$...[...]...$...}]`) to prevent LaTeX bracket parsing errors.
+  5. Write `body_segment_<K>.tex` to `{{paper_dir}}/pass2/`.
+  6. Produce updated CTX JSON: add any new notation entries, defined_terms, labels;
+     update section_state; update brief_narrative (rolling summary, keep bounded —
+     ~150 words max).
+  7. `bd update <WISP> --notes='<updated-json-escaped>'`.
+
+Batching is fine: within a SINGLE Claude invocation you can do steps 1–7 for multiple
+segments. But the order MUST be sequential (iteration K+1 sees CTX after iteration K
+has written it).
+
+Record on THIS bead: count of segments polished, count skipped (already existed),
+notable notation additions.
+
+If the agent running this step is an LLM without direct write access to local files, it
+MUST use the Write tool for body_segment_K.tex and MUST use the Bash tool with
+`bd update --notes=...` for the context bead.
+'''
+
+[[steps]]
+id = "assemble-body"
+title = "Concatenate body_segment_*.tex into body.tex"
+type = "task"
+priority = 2
+needs = ["polish-all-segments"]
+description = '''
+Run:
+  python3 {{.CityRoot}}/packs/latex-utils/assets/scripts/video-to-latex/assemble_body.py \
+    --paper-dir {{paper_dir}}
+
+The helper concatenates `{{paper_dir}}/pass2/body_segment_*.tex` in sorted segment-id
+order into `{{paper_dir}}/body.tex`. Non-LLM.
+
+If any body_segment_*.tex file is missing (whitelist from segments.json), record on this
+bead which segments were missing and proceed with the ones present — the verify step will
+flag the coverage hole.
+'''
+
+[[steps]]
+id = "emit-preamble"
+title = "Write preamble.tex and top-level paper.tex"
+type = "task"
+priority = 2
+needs = ["assemble-body"]
+description = '''
+If {{preamble_path}} is non-empty, copy that file to `{{paper_dir}}/preamble.tex`;
+otherwise copy:
+  {{.CityRoot}}/packs/latex-utils/assets/scripts/video-to-latex/preamble.tex
+to `{{paper_dir}}/preamble.tex`.
+
+Then write `{{paper_dir}}/paper.tex` containing exactly:
+
+  \input{preamble}
+  \begin{document}
+  \input{body}
+  \end{document}
+
+Use absolute paths for both writes.
+'''
+
+[[steps]]
+id = "compile"
+title = "Compile paper.tex with {{tex_engine}}"
+type = "task"
+priority = 2
+needs = ["emit-preamble"]
+description = '''
+`mkdir -p {{paper_dir}}/build` (absolute path; do NOT cd).
+
+Run TWICE (second pass stabilizes internal refs):
+  TEXINPUTS=".:{{paper_dir}}:" {{tex_engine}} \
+    -interaction=nonstopmode \
+    -output-directory={{paper_dir}}/build \
+    {{paper_dir}}/paper.tex
+
+TEXINPUTS is required so \input{preamble} and \input{body} resolve from {{paper_dir}}.
+Append stdout/stderr to `{{paper_dir}}/conversion.log`.
+
+If the second pass exits with a fatal error (no PDF produced), parse the .log for the
+first 'Fatal error' or '! ' line, report it, and STOP. Non-fatal errors (PDF still
+produced) are reported but do not fail the step.
+
+On success, `{{paper_dir}}/build/paper.pdf` exists.
+'''
+
+[[steps]]
+id = "squash-polish-wisp"
+title = "Close the polish-context bead with final state preserved"
+type = "task"
+priority = 3
+needs = ["compile"]
+description = '''
+Read the wisp_id from `{{paper_dir}}/pass2/wisp_id.txt`. Run `bd close <WISP>` to close
+the wisp; its final `notes` field — the complete running-context JSON — is preserved on
+the closed bead.
+
+Record the wisp_id on THIS bead's notes for traceability.
+'''
+
+[[steps]]
+id = "verify"
+title = "Verify fidelity and structural integrity"
+type = "task"
+priority = 2
+needs = ["squash-polish-wisp"]
+description = '''
+Run:
+  python3 {{.CityRoot}}/packs/latex-utils/assets/scripts/video-to-latex/verify.py \
+    --paper-dir {{paper_dir}}
+
+Gates:
+  (HARD) `build/paper.pdf` exists and is non-empty.
+  (SOFT) Every 60-second window of the video has at least one sentence of audio
+         transcript (coverage gate); warn on windows with <1 sentence.
+  (SOFT) Notation consistency: scan body.tex for multiple distinct LaTeX strings likely
+         referring to the same concept (heuristic: macros with same 1–2 letter base with
+         different sub/superscripts — high false-positive rate, so these are WARNINGS not
+         failures).
+  (SOFT) Board-OCR coverage: every segment's non-empty board.tex content should appear
+         (possibly reformatted) somewhere in body.tex; warn on segments whose content
+         seems dropped.
+
+Exit code 0 = full pass, 2 = soft failures only, 1 = hard failure. Report a summary on
+this bead; if soft failures list specific issues, record them as discovered-from beads
+via `bd create ... --deps discovered-from:<this-bead-id>`.
+'''

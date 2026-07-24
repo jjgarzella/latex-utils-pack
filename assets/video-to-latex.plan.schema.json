@@ -1,0 +1,43 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/jjgarzella/latex-utils-pack/video-to-latex.plan.schema.json",
+  "title": "video-to-latex spawn-capture-segments output",
+  "description": "The gc.output_json emitted by the spawn-capture-segments step of video-to-latex. The on_complete fan-out iterates over output.segments, bonding one video-to-latex-capture-segment formula per element. key_frames is a comma-separated string (not an array) so it maps directly to the child formula's key_frames var.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["segments"],
+  "properties": {
+    "segments": {
+      "type": "array",
+      "description": "Ordered list of video segments, one per fan-out bond. Derived from {{paper_dir}}/segments.json produced by calibrate_segments.py.",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "t_start", "t_end", "key_frames"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Zero-padded three-digit segment identifier (e.g. '007').",
+            "pattern": "^[0-9]{3}$"
+          },
+          "t_start": {
+            "type": "number",
+            "description": "Segment start time in seconds (absolute offset into the video/audio).",
+            "minimum": 0
+          },
+          "t_end": {
+            "type": "number",
+            "description": "Segment end time in seconds.",
+            "minimum": 0
+          },
+          "key_frames": {
+            "type": "string",
+            "description": "Comma-separated absolute paths to this segment's key frame PNGs. Primary keyframe first, then supplementary pre-erase frames and uniform-sample frames in time order. Maps directly to the key_frames var of video-to-latex-capture-segment.",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  }
+}
