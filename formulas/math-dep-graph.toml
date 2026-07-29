@@ -18,11 +18,11 @@ description = "The region to graph. Accepted formats: 'section:5', 'subsection:3
 required = true
 
 [vars.paper_path]
-description = "Path to the main .tex file (e.g. papers/2510.22678/main.tex)"
+description = "Path to the main .tex file (e.g. papers/example-paper/main.tex)"
 required = true
 
 [vars.existing_epic]
-description = "ID of an existing dependency-graph epic to extend (e.g. math-playground-9qy). If empty, a new epic is created. If set, new beads are added as children of that epic and existing stubs/results are reused rather than duplicated."
+description = "ID of an existing dependency-graph epic to extend (e.g. example-epic-123). If empty, a new epic is created. If set, new beads are added as children of that epic and existing stubs/results are reused rather than duplicated."
 required = false
 default = ""
 
@@ -191,6 +191,6 @@ id = "generate-visualization"
 title = "Generate Graphviz dependency visualization for {{region}}"
 needs = ["add-definition-deps"]
 description = '''
-Derive a safe filename slug from {{region}} (e.g. 'section-5', 'subsection-3-2', 'lines-808-984'). If {{existing_epic}} is set, prefix the slug with the epic ID (e.g. 'dep-graph-9qy-section-6') to avoid overwriting the previous PNG. Query all beads parented to the target epic (including any carried over from a previous region) via 'cd dep-graph && bd show <epic-id>'. Write <project-root>/dep-graph/<slug>-deps.dot covering the full epic contents with rankdir=LR and color-coded nodes: Definitions in #e8f5e9 (green), external \ref stubs in #ffe0b2 (orange), \cite bibliography stubs in #f3e5f5 (purple), the main theorem(s) in #e3f2fd (blue), everything else white. Node labels: type+number on line 1, 3-5 word description on line 2. Edges in steelblue. Render: dot -Tpng -Gsize="18,12" -Gdpi=150 <project-root>/dep-graph/<slug>-deps.dot -o <project-root>/dep-graph/<slug>-deps.png. Report the output path. (Here <project-root> is the root of the math-playground repo, i.e. the directory containing the .beads/ folder.)
+Derive a safe filename slug from {{region}} (e.g. 'section-5', 'subsection-3-2', 'lines-808-984'). If {{existing_epic}} is set, prefix the slug with the epic ID (e.g. 'dep-graph-123-section-6') to avoid overwriting the previous PNG. Query all beads parented to the target epic (including any carried over from a previous region) via 'cd dep-graph && bd show <epic-id>'. Write <project-root>/dep-graph/<slug>-deps.dot covering the full epic contents with rankdir=LR and color-coded nodes: Definitions in #e8f5e9 (green), external \ref stubs in #ffe0b2 (orange), \cite bibliography stubs in #f3e5f5 (purple), the main theorem(s) in #e3f2fd (blue), everything else white. Node labels: type+number on line 1, 3-5 word description on line 2. Edges in steelblue. Render: dot -Tpng -Gsize="18,12" -Gdpi=150 <project-root>/dep-graph/<slug>-deps.dot -o <project-root>/dep-graph/<slug>-deps.png. Report the output path. (Here <project-root> is the root of the paper repo, i.e. the directory containing the .beads/ folder.)
 '''
 metadata = { "gc.continuation_group" = "main", "gc.session_affinity" = "require" }

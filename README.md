@@ -1,7 +1,7 @@
 # latex-utils
 
 A Gas City **utility pack** of reusable LaTeX helpers — scripts and assets for
-building, linting, and cleaning LaTeX projects across rigs (e.g. `phd-thesis`).
+building, linting, and cleaning LaTeX projects across rigs (e.g. `my-paper-rig`).
 
 It is asset-only: no agents, no named sessions. Import it alongside a
 role-providing pack (like `gasvillage`).
@@ -19,7 +19,7 @@ Add an import to the rig in `city.toml`:
 
 ```toml
 [[rigs]]
-name = "phd-thesis"
+name = "my-paper-rig"
 [rigs.imports.gasvillage]
 source = "packs/gasvillage"
 [rigs.imports.latex-utils]

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """extract_body — strip each entry file down to a bare chapter body.
 
-Tier 1 (wrapper stripping) + Tier 2 (flag-and-defer). Owner: pt-axx (T5).
+Tier 1 (wrapper stripping) + Tier 2 (flag-and-defer).
 Part of the mol-latex-concat formula (latex-utils pack). Runs immediately AFTER
 rewrite_paths.py in the `transform-sources` step (it reads the mirrored, path-rewritten
 entry file rewrite_paths produced).
