@@ -11,8 +11,8 @@ The scoring heuristic is variance of grayscale pixel values in the central 40%
 of the frame — chalk strokes on a dark board produce high-frequency texture
 (high variance), while a smooth speaker silhouette produces low variance. This
 was chosen as the starting heuristic; alternatives (center-minus-edge darkness,
-color-histogram dissimilarity, lightweight person-detection) are tracked as v3
-candidates in beads (see youtube-latex-av6 notes).
+color-histogram dissimilarity, lightweight person-detection) are noted as
+candidates for a future revision.
 
 Usage from other scripts:
     from occlusion import extract_best_keyframe

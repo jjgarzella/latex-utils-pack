@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """rewrite_paths — mirror each source into contents/<slug>/ and rewrite relative paths.
 
-Tier 1 (mechanical, literal path rewriting) + Tier 2 (flag-and-defer). Owner: pt-axx (T5).
+Tier 1 (mechanical, literal path rewriting) + Tier 2 (flag-and-defer).
 Part of the mol-latex-concat formula (latex-utils pack). Runs FIRST in the
 `transform-sources` step; extract_body.py runs immediately after it.
 
@@ -65,9 +65,8 @@ AUX_SUFFIXES = (
 GRAPHICS_EXTS = (".pdf", ".png", ".jpg", ".jpeg", ".eps", ".ps", ".mps",
                  ".gif", ".tif", ".tiff", ".bmp")
 
-# The four path-bearing commands this formula rewrites (bead pt-axx). Negative
-# lookahead keeps \includegraphics from matching \include, \subfileinclude from
-# matching \subfile, etc.
+# The four path-bearing commands this formula rewrites. Negative lookahead keeps
+# \includegraphics from matching \include, \subfileinclude from matching \subfile, etc.
 CMD_RE = re.compile(r"\\(input|include|subfile|includegraphics)(?![A-Za-z@])")
 GRAPHICSPATH_RE = re.compile(r"\\graphicspath(?![A-Za-z@])")
 
