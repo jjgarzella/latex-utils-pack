@@ -72,6 +72,10 @@ priority = 1
 needs = ["resolve-seeds"]
 description = '''
 Create papers/{{slug}}/deps.dot with preamble: `digraph litsearch {\n  rankdir=LR;\n  node [shape=box, fontname="Helvetica"];\n`. Do NOT close the brace — later steps and child molecules append to this file; close-and-render-graph will add the closing brace. For each seed from resolve-seeds's output.seeds, append a seed node line: `  "paper-<arxiv-id-dotless>" [label="<AuthorLast YYYY>\n<short-title>", shape=box, color=blue];` (arxiv-id-dotless replaces . with -). Seeds are color=blue to distinguish visually. Create papers/{{slug}}/seen.txt as an EMPTY file (`touch papers/{{slug}}/seen.txt`). Do NOT pre-populate seen.txt with seed IDs — each seed's litsearch-process-paper molecule claims its slot in check-caps-and-dedup under flock. Pre-populating causes check-caps-and-dedup to skip all seeds as "already processed." Create an empty papers/{{slug}}/.deps.lock (just `touch` it — it exists for `flock` to acquire). Record on this bead the seed-to-slug mapping as notes.
+
+Initialize the pack-level saturation ledger and its compiler check wrapper:
+`python3 {{.CityRoot}}/packs/latex-utils/assets/scripts/litsearch_saturation.py init --state papers/{{slug}}/saturation.json --check-script papers/{{slug}}/saturation-check.sh --checker {{.CityRoot}}/packs/latex-utils/assets/scripts/litsearch_saturation.py --seed '<arxiv-id>' ...`
+Pass one `--seed` for each distinct arXiv ID in resolve-seeds output.seeds (none for non-arXiv-only searches). This registers all initial work before seed fan-out. The helper is idempotent so a resumed search retains its recorded votes.
 '''
 
 [[steps]]
@@ -81,25 +85,19 @@ type = "task"
 priority = 1
 needs = ["init-graph"]
 description = '''
-This step is the root anchor for the entire BFS. Every recursive litsearch-process-paper molecule at every depth is bonded against this bead's ID (root_bead) via the root_bead var, so the tally gate catches the full tree.
-
-1. Determine this bead's own ID: run `bd mol current --json` or query `bd list --status=in_progress --json` and find the bead whose title matches this step's title; record the ID as root_bead_id.
-
-2. Read the confirmed arXiv seed list from resolve-seeds's gc.output_json (list of {arxiv_id, title} objects).
-
-3. Emit `gc.output_json` as:
+Read the confirmed arXiv seed list from resolve-seeds's gc.output_json (list of {arxiv_id, title} objects). Remove duplicate arXiv IDs while preserving the first title for each. Emit `gc.output_json` as:
    {
      "seeds": [
        {
          "arxiv_id": "<id>",
          "title": "<title>",
-         "root_bead_id": "<root_bead_id>",
+         "work_id": "seed|<id>",
          "max_depth": {{max_depth}}
        },
        ...
      ]
    }
-   Include one entry per confirmed arXiv seed. Non-arXiv seeds are NOT included (they are leaf nodes only, recorded by init-graph). The root_bead_id and max_depth fields are threaded through to all child molecules via on_complete.vars so they can propagate the root anchor and enforce recursion bounds.
+Include one entry per distinct confirmed arXiv seed. Non-arXiv seeds are NOT included (they are leaf nodes only, recorded by init-graph). The `work_id` matches the seed entry registered by init-graph. `max_depth` is threaded through to child molecules to enforce recursion bounds.
 '''
 
 [steps.on_complete]
@@ -113,11 +111,8 @@ parent_slug = "{{slug}}"
 scope = "{{scope}}"
 date_cap = "{{date_cap}}"
 hard_cap = "{{max_papers}}"
-root_bead = "{item.root_bead_id}"
+work_id = "{item.work_id}"
 max_depth = "{item.max_depth}"
-
-[steps.tally]
-mode = "any-pass"
 
 [[steps]]
 id = "await-saturation"
@@ -126,14 +121,26 @@ type = "task"
 priority = 1
 needs = ["seed-fanout"]
 description = '''
-Unblocks only after the seed-fanout tally resolves — meaning every litsearch-process-paper molecule bonded to this search (directly or recursively) has completed. When this step runs, the BFS has saturated: every branch either ran out of in-scope citations, hit date_cap, hit max_papers (hard_cap), hit max_depth (depth reached 0), or was deduped.
+Wait for the pack-level saturation ledger to report that every scheduled paper, including recursive descendants, has cast a terminal vote. Each parent registers newly reserved descendants before emitting its on_complete output, so there is no moment when the queue can appear empty between parent completion and child fan-out.
+
+Run:
+`python3 {{.CityRoot}}/packs/latex-utils/assets/scripts/litsearch_saturation.py wait --state papers/{{slug}}/saturation.json --timeout-seconds 86400 --poll-seconds 15`
+
+The command succeeds only when the pending queue is empty and every terminal vote is either success or an expected skip (duplicate or hard_cap). If a paper reports failure, or scheduled work never votes before the bounded 24-hour wait expires, record the failure and do not report saturation. The formula check on this step independently verifies a clean ledger before any downstream summary or export step can run.
 
 Record final statistics as notes on this bead:
-- count of molecules spawned (from `bd list --json` filtered by this molecule's epic)
-- count of completed vs failed
+- count of scheduled work items, successful votes, skipped votes, and failed votes (from the helper's JSON)
 - final deps.dot node count (grep -c of node lines) and edge count
 - bound reason: max_papers, max_depth, natural saturation, or mixed
 '''
+
+[steps.check]
+max_attempts = 1
+
+[steps.check.check]
+mode = "exec"
+path = "papers/{{slug}}/saturation-check.sh"
+timeout = "2m"
 
 [[steps]]
 id = "close-and-render-graph"
