@@ -34,8 +34,8 @@ description = "Cap on total nodes in deps.dot. When the node count reaches hard_
 required = false
 default = "100"
 
-[vars.root_bead]
-description = "The bead ID of the parent arxiv-lit-search molecule's seed-fanout step. Passed through at every recursion depth so downstream molecules share a consistent root anchor."
+[vars.work_id]
+description = "Unique queue key for this scheduled paper molecule. Seed keys are `seed|<arxiv-id>`; recursive keys append `|<arxiv-id>` to the parent's key."
 required = true
 
 [vars.max_depth]
@@ -152,8 +152,12 @@ Release the lock.
 
 Parse {{max_depth}} as an integer (call it `depth`). Compute `depth_next = max(0, depth - 1)`. If `depth == 0`, do NOT recurse: set new_frontier = [] regardless of what in-scope citations were found — this terminates the BFS branch at this level.
 
+For every item in new_frontier, set its `work_id` to `{{work_id}}|<arxiv_id>` and register it in the pack-level saturation ledger BEFORE emitting output. Run:
+`python3 {{.CityRoot}}/packs/latex-utils/assets/scripts/litsearch_saturation.py enqueue --state papers/{{parent_slug}}/saturation.json --work-id '<work_id>' --arxiv-id '<arxiv_id>'`
+Once all new items are registered, emit the output below. If registration fails, do not emit fan-out output; let this step fail so the search cannot report a false saturation.
+
 Set `gc.output_json` on this bead to:
-  {"nodes_added": <count>, "edges_added": <count>, "new_frontier": [{"arxiv_id": "<id>", "title": "<title>", "year": <year>, "max_depth": <depth_next>}, ...]}
+  {"nodes_added": <count>, "edges_added": <count>, "new_frontier": [{"arxiv_id": "<id>", "title": "<title>", "year": <year>, "work_id": "<parent-work-id>|<id>", "max_depth": <depth_next>}, ...]}
 
 new_frontier contains ONLY items newly reserved in seen.txt during this step (case b above) AND only when depth > 0. Each item carries `max_depth: depth_next` so the child molecule inherits the decremented depth. Items already in seen.txt before this step started are excluded. An empty new_frontier terminates this BFS branch naturally.
 '''
@@ -170,5 +174,23 @@ parent_slug = "{{parent_slug}}"
 scope = "{{scope}}"
 date_cap = "{{date_cap}}"
 hard_cap = "{{hard_cap}}"
-root_bead = "{{root_bead}}"
+work_id = "{item.work_id}"
 max_depth = "{item.max_depth}"
+
+[[steps]]
+id = "record-saturation-vote"
+title = "Record terminal saturation vote for {{arxiv_id}}"
+type = "task"
+priority = 1
+needs = ["append-to-graph"]
+description = '''
+Record exactly one terminal vote for this scheduled paper after its child citations have been reserved and its recursive fan-out output is complete. Use the same helper as the parent search:
+`python3 {{.CityRoot}}/packs/latex-utils/assets/scripts/litsearch_saturation.py finish --state papers/{{parent_slug}}/saturation.json --work-id '{{work_id}}' --arxiv-id '{{arxiv_id}}' --outcome <success|skipped|failed> --reason '<brief reason>'`
+
+Choose the outcome from this molecule's earlier notes:
+- `skipped` when check-caps-and-dedup set `skip: true` (already processed or hard_cap reached).
+- `failed` when download-paper set `download_failed: true`, extract-intro set `intro_extracted: false`, citation classification or graph append recorded a failure, or another required processing step could not produce a valid result. These are terminal branches, but they must not make the parent search report clean success.
+- `success` when this paper was processed or reused successfully, including a natural leaf, date_cap-only frontier, or max_depth=0 leaf.
+
+If recording the vote fails, fail this step. The parent ledger must never silently remove a pending item.
+'''
