@@ -80,7 +80,7 @@ Pass one `--seed` for each distinct arXiv ID in resolve-seeds output.seeds (none
 
 [[steps]]
 id = "seed-fanout"
-title = "Record root-bead identity and trigger per-seed litsearch-process-paper fan-out"
+title = "Schedule per-seed litsearch-process-paper fan-out"
 type = "task"
 priority = 1
 needs = ["init-graph"]
